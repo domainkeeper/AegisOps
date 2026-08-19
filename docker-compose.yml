@@ -1,1 +1,8 @@
-# Placeholder — compose definition for auth-api (+ optional postgres) will be defined in the implementation phase.
+services:
+  auth-api:
+    build:
+      context: ./infrastructure/auth_api
+    container_name: auth-api
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

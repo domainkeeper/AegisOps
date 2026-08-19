@@ -29,8 +29,8 @@ All invoke() calls pass through the ArmorIQ Proxy for verification before reachi
 
 | Item | Definition |
 |---|---|
-| **Problem** | Autonomous agents can be *capable* of an action without being *authorized* to perform it. "Who authorized that?" |
-| **User** | Demo audience / judges. Triggered via `scripts/break_service.sh` and `scripts/run_incident.sh`. |
+| **Problem** | Autonomous agents can be *capable* of an action without being *authorized* to perform it. Authorization must be proven, not assumed. |
+| **User** | Operator / demo runner. Triggered via `scripts/break_service.sh` and `scripts/run_incident.sh`. |
 | **Core workflow** | Break service → Commander captures plan + delegates scoped tokens → Log Agent reads logs → Diagnosis Agent inspects status/config → Diagnosis Agent *attempts* restart (BLOCKED) → Commander delegates restart → Remediation Agent restarts (ALLOWED) → health verified → audit trail shown. |
 | **Agents** | Commander, Log, Diagnosis, Remediation — 4 separate processes, 4 separate Ed25519 keypairs, 4 separate ArmorIQ clients. |
 | **MCP tools** | `search_logs`, `get_service_status`, `inspect_config` (read-only), `restart_service` (write). |
@@ -350,40 +350,54 @@ flowchart LR
 
 ## 9. Infrastructure Architecture
 
-Minimal Docker environment (PLAN §3, §13 Phase 2).
+Minimal Docker environment (PLAN §3, §13 Phase 2). **Implemented in Phase 2 (2026-08-19); all behaviors below
+are verified by tests and manual runs.**
 
 ### 9.1 Services
 
 | Service | Why it exists | State |
 |---|---|---|
-| `auth-api` (FastAPI/Flask) | The service we break and heal — the real-world effect of `restart_service` | In-memory: a healthy flag. `/health` → 200 when healthy, 5xx when broken. Optional Postgres only for "looks real" flavor; **cut first** if short on time. |
-| Postgres (optional) | Cosmetic only | Cut-first per PLAN §3/§13. |
+| `auth-api` (FastAPI, `infrastructure/auth_api/main.py`) | The service we break and heal — the real-world effect of `restart_service` | In-memory `broken` flag + `started_at`. `/health` → 200 `{"status":"healthy",...}` when healthy, 503 `{"status":"unhealthy","reason":"simulated_failure",...}` when broken. A real container restart resets the flag → healthy again. |
+| Postgres (optional) | Cosmetic only — **cut** | Not in the compose file; add only if "real infra" flavor is ever needed. |
 
-### 9.2 Lifecycle
+### 9.2 Health model & lifecycle (implemented)
 
-| Phase | Mechanism |
-|---|---|
-| **Start** | `scripts/start_env.sh` → `docker compose up -d`, wait for `/health` 200. |
-| **Break** | `scripts/break_service.sh` → `POST /break` flips `auth-api` into a 500-erroring "unhealthy" state **without stopping the container** (so `get_service_status()` can still observe it). |
-| **Detect** | `get_service_status()` hits `auth-api` `/health`. |
-| **Restart** | `restart_service()` runs `docker restart auth-api` (or `docker compose restart auth-api`). Restart clears the in-memory broken flag → container comes back healthy. |
-| **Verify** | Poll `/health` until 200 OK, 30s timeout. |
-| **Reset** | `scripts/reset_demo.sh` → `POST /fix` (inverse of `/break`) + clear SQLite `incidents`/`audit_events`; or full `docker compose down -v && up -d`. |
+| Phase | Mechanism | Verified |
+|---|---|---|
+| **Start** | `scripts/start_env.sh` → `docker compose up -d --build`, polls `/health` until 200 (30s cap) | ✅ |
+| **Check** | `scripts/check_health.sh` → `curl /health` | ✅ |
+| **Break** | `scripts/break_service.sh` → `POST /break` flips the in-memory flag → `/health` returns 503 **without stopping the container** (so a future `get_service_status()` can still observe it) | ✅ |
+| **Detect** | (future) `get_service_status()` hits `auth-api` `/health` — endpoint ready | — |
+| **Restart** | `scripts/restart_service.sh` → `docker restart auth-api` — the real operation the future Remediation MCP's `restart_service()` will wrap. Start time changes; broken flag cleared by process restart | ✅ |
+| **Verify** | Poll `/health` until 200 OK, 30s timeout | ✅ |
+| **App-level fix** | `scripts/fix_service.sh` → `POST /fix` clears the flag without a restart (recovery path distinct from the real restart; used by tests and reset) | ✅ |
+| **Reset** | `scripts/reset_demo.sh` → `docker compose down -v && up -d --build` + wait healthy (Phase 7 will also clear the SQLite tables here) | ✅ |
 
-### 9.3 Infrastructure diagram
+### 9.3 Container details
+
+- `Dockerfile`: `python:3.12-slim`, installs `fastapi==0.141.1` + `uvicorn==0.52.4`, exposes 8080, includes a
+  `HEALTHCHECK` hitting `/health`.
+- Compose: single root `docker-compose.yml`, service `auth-api`, `container_name: auth-api`, host port `8080:8080`,
+  `restart: unless-stopped`. (One compose file only — the infra-local duplicate is not created.)
+
+### 9.4 Infrastructure diagram
 
 ```mermaid
 flowchart LR
     subgraph Docker["docker compose"]
-        API["auth-api<br/>/health · /break · /fix"]
-        PG["postgres (optional, cut-first)"]
+        API["auth-api (FastAPI)<br/>GET /health · POST /break · POST /fix<br/>in-memory state, port 8080"]
     end
-    LM["Log MCP"] -->|"docker logs / log file"| API
-    DM["Diagnostic MCP"] -->|"/health"| API
-    DM -->|"docker inspect"| API
-    RM["Remediation MCP"] -->|"docker restart auth-api"| API
-    API -->|"stdout logs"| LOGFILE["log source"]
+    LM["Log MCP (future)"] -->|"docker logs"| API
+    DM["Diagnostic MCP (future)"] -->|"GET /health"| API
+    RM["Remediation MCP (future)"] -->|"docker restart auth-api"| API
 ```
+
+### 9.5 Security boundary (for the future remediation tool)
+
+The future Remediation MCP must expose a **narrowly scoped operation**, not arbitrary shell. The intended shape:
+`restart_service(service: str)` → validated `service` argument → `docker restart auth-api` (fixed mapping, no
+shell interpolation, no generic `run_shell(command)` anywhere). Authorization is enforced upstream at the
+ArmorIQ Proxy; the tool itself stays single-purpose.
 
 ---
 
@@ -500,21 +514,27 @@ AegisOps/
 │   └── client_setup.py        # env loading, ARMORIQ_API_KEY validation, client factory, Ed25519 keypair helpers
 ├── infrastructure/
 │   ├── auth_api/
-│   │   └── main.py           # Tiny FastAPI app: /health, /break, /fix
-│   └── docker-compose.yml    # (root docker-compose.yml may supersede; keep single source)
+│   │   ├── main.py           # FastAPI app: /health, /break, /fix (in-memory state)
+│   │   ├── requirements.txt  # fastapi + uvicorn (container deps, pinned)
+│   │   ├── Dockerfile        # python:3.12-slim, port 8080, HEALTHCHECK
+│   │   └── .dockerignore
 ├── database/
 │   ├── schema.sql            # incidents + audit_events DDL
 │   └── db.py                 # Thin sqlite3 wrapper
 ├── tests/
-│   ├── test_mcp_tools.py     # Direct MCP tool tests vs running container
-│   ├── test_authorization.py # Security path (blocked) + happy path (allowed) — critical
-│   └── test_e2e.py           # Full incident flow + final health assertion
+│   ├── test_infrastructure.py # Phase 2: health/break/real-restart lifecycle
+│   ├── test_mcp_tools.py      # Direct MCP tool tests vs running container
+│   ├── test_authorization.py  # Security path (blocked) + happy path (allowed) — critical
+│   └── test_e2e.py            # Full incident flow + final health assertion
 ├── scripts/
 │   ├── armoriq_smoke_test.py  # SDK smoke test (Phase 1): local checks + optional network checks
 │   ├── start_env.sh           # compose up + wait for health
+│   ├── check_health.sh        # curl /health
 │   ├── break_service.sh       # POST /break
-│   ├── run_incident.sh        # Kick off Commander with hardcoded incident
-│   └── reset_demo.sh          # POST /fix + clear SQLite rows
+│   ├── fix_service.sh         # POST /fix (app-level recovery)
+│   ├── restart_service.sh     # docker restart auth-api (the real remediation operation)
+│   ├── run_incident.sh        # (future) Kick off Commander with hardcoded incident
+│   └── reset_demo.sh          # compose down -v + up; (future) + clear SQLite rows
 ├── .env.example               # ARMORIQ_API_KEY placeholder + optional endpoint overrides — never the real .env
 ├── .gitignore                 # .env, .venv, .keys/, .armoriq/, *.db, __pycache__
 ├── .keys/                     # (gitignored) per-agent Ed25519 keypairs: <agent>.pem + <agent>.pub
@@ -544,7 +564,7 @@ all other directories still contain only `.gitkeep` placeholders. Agent/MCP/infr
 | 7 | Commander dispatch may be hardcoded (safe cut); only Diagnosis LLM call is "must-have-ish" (SHOULD HAVE) | Timebox | PLAN §8, §14 |
 | 8 | Secrets in `.env` only; no Vault/KMS | Explicit DO-NOT-BUILD | PLAN §14 |
 | 9 | No generic agent framework; build exactly this scenario | Explicit DO-NOT-BUILD | PLAN §14 |
-| 10 | Trail viewer = minimal HTML page OR plain terminal/`audit_events` output | Option 2 only if Phase 10 time remains; Option 1 is judge-acceptable | PLAN §15 |
+| 10 | Trail viewer = minimal HTML page OR plain terminal/`audit_events` output | Option 2 only if Phase 10 time remains; Option 1 is acceptable | PLAN §15 |
 | 11 | **NEW (verified):** venv on Python 3.12 — `armoriq-sdk` does not support 3.14 | PyPI requires `>=3.10,<3.14` | Verified 2026-08-19 |
 | 12 | **NEW (verified):** per-agent `user_email` (`commander@aegisops.local`, etc.) + per-process keypairs carry agent identity under the one-key/for_user model | `user_id`/`agent_id` deprecated in current SDK; identity = process + keypair + email scope | Client Initialization docs, verified 2026-08-19 |
 
@@ -581,7 +601,7 @@ Dependency-aware order from PLAN §13. Each phase is gated on the previous one:
 | # | Phase | Why this order |
 |---|---|---|
 | 1 | **Project skeleton** — `.gitignore`, `.env.example`, deps, compose skeleton, API key working — **DONE (2026-08-19)**: env on Python 3.12, SDK verified + installed (0.6.10), client/identity foundation (`armoriq/client_setup.py`), smoke test (`scripts/armoriq_smoke_test.py`, local path passes) | Foundation; everything else depends on it |
-| 2 | **Docker infrastructure** — `auth-api` with `/health` `/break` `/fix`; manual break/restart/heal | MCPs need a real target; proves the real-world effect first |
+| 2 | **Docker infrastructure** — `auth-api` with `/health` `/break` `/fix`; manual break/restart/heal — **DONE (2026-08-19)**: FastAPI service + Dockerfile + root compose + 6 dev scripts; break → 503, real `docker restart auth-api` → healthy (start-time proven); 5/5 tests pass (§9) | MCPs need a real target; proves the real-world effect first |
 | 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` speaking **JSON-RPC 2.0 + SSE** (`initialize`/`tools/list`/`tools/call`), registered on the platform under exact names; resolve local-MCP connectivity first (§8.3) | Agents need tools; tools need infra (Phase 2) and registration |
 | 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
 | 5 | **ArmorIQ identities + plan** — per-agent keypairs; `capture_plan()` → `get_intent_token()` | The authorization layer's foundation |

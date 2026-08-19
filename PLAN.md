@@ -1,6 +1,6 @@
 # AegisOps — PLAN.md
 
-**Track:** ArmorIQ — Problem 2: "Who authorized that?"
+**Problem statement:** Autonomous incident response with cryptographically enforced agent authority.
 **Tagline:** Autonomous incident response with cryptographically enforced agent authority.
 **Timebox:** 1 day (~9-10 working hours)
 **Core claim we must prove:** CAPABLE ≠ AUTHORIZED
@@ -71,7 +71,7 @@ Key facts we rely on for the demo, taken directly from current docs:
 - `capture_plan()` does **not** call an LLM or invent a plan — we must supply the explicit `goal` + `steps` structure ourselves, naming our onboarded MCPs and actions. This is good for us: it means the "plan" is a deliberate, explicit artifact we control.
 - `get_intent_token()` canonicalizes the plan, computes a `plan_hash`, builds a Merkle tree over the steps, and returns a Merkle proof (`step_proofs`) per step, signed with Ed25519.
 - `invoke()` is checked step-by-step against the signed plan at the ArmorIQ Proxy: it validates the Merkle proof, the CSRG path, the value digest, and the token signature. If the action isn't part of the captured/allowed plan, it raises `IntentMismatchException` (or the SDK's proxy-level "blocked" response) — **not** a keyword match.
-- `delegate()` mints a **new, restricted, cryptographically-bound token** for a sub-agent, tied to that sub-agent's Ed25519 public key, with an explicit `allowed_actions` allow-list and a shorter validity window than the parent token. This is exactly the primitive Problem 2 wants: parent explicitly delegates a scoped subset of authority.
+- `delegate()` mints a **new, restricted, cryptographically-bound token** for a sub-agent, tied to that sub-agent's Ed25519 public key, with an explicit `allowed_actions` allow-list and a shorter validity window than the parent token. This is exactly the primitive we want: parent explicitly delegates a scoped subset of authority.
 - Delegation is non-transferable, time-limited, action-restricted, auditable (`delegation_id`, `trust_delta`), and revocable via parent token expiry.
 
 VERIFY AGAINST CURRENT ARMORIQ SDK DOCS before coding — in particular confirm on the day: (a) the exact package name/version (`armoriq-sdk` on PyPI), (b) whether your onboarded MCPs must be pre-registered on the ArmorIQ platform (`platform.armoriq.ai`) before `capture_plan()`/`invoke()` will accept them, and (c) the current shape of the "blocked" response from `invoke()` (exception vs. `success: false` result) so error handling matches reality.
@@ -105,7 +105,7 @@ That is the entire product. Resist adding anything else.
 - Verification happens against a **signed Merkle proof of the plan step**, tied to the caller's own Ed25519 keypair (via `delegate_public_key`), at the ArmorIQ Proxy — outside the agent process entirely. Even if the Diagnosis Agent's LLM reasoning, or an attacker via prompt injection, decides to call `restart_service`, the SDK/Proxy rejects it because the *token* doesn't carry that authority — not because of anything in the text of the request.
 - Rename the action to `svc_bounce_x92` in both places and the demo still works identically, because enforcement is keyed on the signed plan/allow-list, not the string.
 
-State this explicitly in the demo narration — it's the single most important thing judges are checking.
+State this explicitly in the incident narration — it's the single most important point the system demonstrates.
 
 ---
 
@@ -158,7 +158,7 @@ Each MCP is a tiny FastAPI/Flask process (~80-100 lines) exposing `POST /mcp` in
 
 ## 5. Agents as genuinely separate clients
 
-Do **not** implement four classes in one Python file. Minimum viable "separate agent" for a one-day hackathon:
+Do **not** implement four classes in one Python file. Minimum viable "separate agent" for a one-day build:
 
 - Each agent is its **own Python process/script** (`agents/commander.py`, `agents/log_agent.py`, `agents/diagnosis_agent.py`, `agents/remediation_agent.py`), started independently (separate terminal or `docker compose` service, or a `honcho`/`Procfile`/simple `subprocess.Popen` launcher script).
 - Each agent process, on startup, **generates its own Ed25519 keypair** (`cryptography.hazmat.primitives.asymmetric.ed25519`) and holds its own `ArmorIQClient` instance. Verified on the day: the current SDK uses a **one-key, per-request-email** identity model — `ArmorIQClient(api_key=...)` per process, plus `for_user(email)` scopes. `user_id`/`agent_id` are deprecated (resolved per-request). Identity separation therefore = separate processes + separate keypairs (bound at `delegate()`) + a per-agent email (`commander@aegisops.local`, `diagnosis@aegisops.local`, ...) passed as `user_email` on every call.
@@ -342,7 +342,7 @@ Skip if behind: drop the optional Postgres container; keep state in-memory in `a
 ### Phase 3 — MCP tools (60-75 min)
 Tasks: build `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` as small FastAPI services wrapping the Docker/`auth-api` calls from Phase 2.
 Done when: each tool callable directly via curl/HTTP and returns correct data for both healthy and broken states.
-Skip if behind: combine all three into one process with three routes if MCP separation is taking too long — note the simplification in README, but keep trying for genuinely separate services since the challenge wants it.
+Skip if behind: combine all three into one process with three routes if MCP separation is taking too long — note the simplification in README, but keep trying for genuinely separate services since the architecture requires it.
 
 ### Phase 4 — Agents, unguarded (90 min)
 Tasks: build Commander/Log/Diagnosis/Remediation as separate processes calling MCP tools directly (no ArmorIQ yet), communicating over simple HTTP endpoints; Diagnosis Agent's LLM call to decide "restart needed."
@@ -352,12 +352,12 @@ Skip if behind: hardcode Commander's task dispatch order instead of making it dy
 ### Phase 5 — ArmorIQ: identities + plan (60 min)
 Tasks: each agent generates its Ed25519 keypair on startup; Commander builds the explicit 4-step plan and calls `capture_plan()` → `get_intent_token()`.
 Done when: `commander_token` printed/logged successfully with a real `plan_hash`.
-Skip if behind: none — this is core to the challenge.
+Skip if behind: none — this is core to the system.
 
 ### Phase 6 — ArmorIQ: delegation (60 min)
 Tasks: Commander calls `delegate()` for Log Agent, Diagnosis Agent (restricted `allowed_actions`), and (later, after diagnosis) Remediation Agent; delegated tokens passed to sub-agents over HTTP.
 Done when: each sub-agent holds a distinct delegated token with correct `allowed_actions`, confirmed by printing `delegation_id`/`allowed_actions`.
-Skip if behind: none — this is core to the challenge.
+Skip if behind: none — this is core to the system.
 
 ### Phase 7 — Wire invoke() into every MCP call (45 min)
 Tasks: replace direct MCP HTTP calls in each agent with `client.invoke(mcp, action, token, params)`.
@@ -377,7 +377,7 @@ Skip if behind: none.
 ### Phase 10 — Testing, audit trail view, demo polish (60-90 min)
 Tasks: write the tests in §11 (at least the two critical ones); build a minimal terminal/log-based or single-page trail viewer (plain HTML+fetch from SQLite via a tiny endpoint is enough — see §14); write `scripts/reset_demo.sh`; run the full demo 2-3 times back to back to confirm repeatability.
 Done when: you can run `scripts/reset_demo.sh && scripts/run_incident.sh` and get the same result every time.
-Skip if behind: cut the trail viewer UI entirely and just `cat`/pretty-print `audit_events` and terminal logs live during the demo — this is a legitimate, judge-acceptable fallback per the brief ("ArmorIQ dashboard + terminal/log output is acceptable").
+Skip if behind: cut the trail viewer UI entirely and just `cat`/pretty-print `audit_events` and terminal logs live during the demonstration — this is a legitimate, acceptable fallback ("ArmorIQ dashboard + terminal/log output is acceptable").
 
 ---
 
@@ -419,13 +419,13 @@ Skip if behind: cut the trail viewer UI entirely and just `cat`/pretty-print `au
 
 Recommendation: **Option 2 — tiny HTML/FastAPI interface**, and only if Phase 10 has time left; otherwise Option 1 (no custom frontend — terminal output + ArmorIQ platform dashboard).
 
-Reasoning: the challenge and our own goal explicitly want this **backend-heavy**. A single static HTML page (one `fetch()` to a `/audit` endpoint backed by SQLite, rendered as a simple table: agent | action | result | timestamp) takes under an hour and makes the "blocked vs allowed" story visually obvious without stealing time from the ArmorIQ integration, which is what's actually being judged. A React dashboard is explicitly out of scope per the brief and would burn hours better spent hardening Phases 5-9.
+Reasoning: the project is intentionally **backend-heavy**. A single static HTML page (one `fetch()` to a `/audit` endpoint backed by SQLite, rendered as a simple table: agent | action | result | timestamp) takes under an hour and makes the "blocked vs allowed" story visually obvious without stealing time from the ArmorIQ integration, which is the core of the system. A React dashboard is explicitly out of scope and would burn hours better spent hardening Phases 5-9.
 
 ---
 
 ## 16. Demo script (3:30-4:00 total)
 
-- **0:00-0:30** — Problem: "Who authorized that?" — agents are getting more autonomous and capable; capability isn't the same as authority. Show the architecture diagram for 5 seconds.
+- **0:00-0:30** — Problem: the authorization gap — agents are getting more autonomous and capable; capability isn't the same as authority. Show the architecture diagram for 5 seconds.
 - **0:30-1:15** — Trigger the incident (`scripts/break_service.sh`), show Log Agent and Diagnosis Agent investigating in separate terminal panes, each with its own process/keypair visible in logs.
 - **1:15-2:00** — Diagnosis Agent concludes "auth-api needs a restart" and attempts `restart_service`.
 - **2:00-2:30** — ArmorIQ blocks it live on screen; show the `IntentMismatchException`/blocked response and the `audit_events` row appearing.
@@ -442,7 +442,7 @@ Reasoning: the challenge and our own goal explicitly want this **backend-heavy**
 - `scripts/run_incident.sh` — kicks off Commander with a hardcoded incident description, runs the full flow, prints a summary of blocked/allowed events at the end.
 - `scripts/reset_demo.sh` — `curl -X POST auth-api/fix` (or full `docker compose down -v && up -d`) + `DELETE FROM incidents; DELETE FROM audit_events;` on the local SQLite DB, so the next run starts clean.
 
-Run `reset_demo.sh` immediately before the actual judged demo, and rehearse the full loop at least twice back-to-back beforehand.
+Run `reset_demo.sh` immediately before the actual demonstration, and rehearse the full loop at least twice back-to-back beforehand.
 
 ---
 
@@ -479,7 +479,7 @@ Run `reset_demo.sh` immediately before the actual judged demo, and rehearse the 
 - Never commit secrets — double check before the final push, especially in any committed logs/screenshots.
 
 **README structure**
-1. Problem — "Who authorized that?" in 2-3 sentences
+1. Problem — the authorization gap in 2-3 sentences
 2. Solution — AegisOps one-paragraph pitch
 3. Architecture — the diagram from §3
 4. Agents — table from §4/§6 roles
@@ -496,7 +496,7 @@ Run `reset_demo.sh` immediately before the actual judged demo, and rehearse the 
 |---|---|
 | ArmorIQ SDK behaves differently than current docs (Beta software) | Re-check `docs.armoriq.ai/sdk/core-methods` first thing in Phase 5; keep Phase 4's unguarded version working as a safety net so the demo can still show the *scenario* even if ArmorIQ integration has to be simplified |
 | Separate client/keypair setup takes too long | Fall back to separate *processes* with separate keypairs but a shared minimal client wrapper module (still satisfies "separate clients with separate keypairs" — the identity, not the code, must be separate) |
-| MCP servers flaky / hard to stand up "real" MCP protocol | Simplify to plain HTTP services acting as MCP tool wrappers (note as a documented, judge-acceptable scope cut) |
+| MCP servers flaky / hard to stand up "real" MCP protocol | Simplify to plain HTTP services acting as MCP tool wrappers (note as a documented scope cut) |
 | Authorization not enforcing as expected (block/allow not behaving) | Debug with a tiny isolated repro script (2 invoke calls, one with each token) outside the full agent system before debugging in the full pipeline |
 | Docker restart flaky in the room (network/laptop issues) | Rehearse with `scripts/reset_demo.sh` beforehand; have a pre-recorded 60-second backup clip of one full successful run as an emergency fallback |
 | LLM unpredictable (diagnosis reasoning inconsistent) | Keep the LLM call narrow (small structured prompt: "given this status/config, is a restart needed? yes/no + one sentence why") and keep the actual control flow (attempt restart) deterministic once "yes" is reached, per §8 |

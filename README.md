@@ -2,8 +2,6 @@
 
 **Autonomous incident response with cryptographically enforced agent authority.**
 
-*Track: ArmorIQ — Problem 2: "Who authorized that?"*
-
 > **CAPABLE ≠ AUTHORIZED.**
 
 ---
@@ -12,7 +10,7 @@
 
 Autonomous agents can now investigate and act on real infrastructure. But capability is not the same as
 authority: an agent that *can* restart a service is not the same as an agent that *may* restart it.
-When agents make real-world changes, the question that matters is: **who authorized that?**
+When agents make real-world changes, authorization must be proven, not assumed.
 
 ## Solution
 
@@ -64,7 +62,7 @@ The first is **blocked** by ArmorIQ. The second **succeeds**. The only differenc
 cryptographically-signed token was presented — enforcement is keyed on the token's allow-list and signed
 plan proof, never on the text of the request and never on what an LLM intends.
 
-## Demo Scenario
+## Incident Scenario
 
 1. `auth-api` container is broken (`POST /break`)
 2. Commander captures the plan and delegates scoped tokens
@@ -92,6 +90,9 @@ plan proof, never on the text of the request and never on what an LLM intends.
 - **Foundation established** — Python 3.12 venv, pinned `requirements.txt`, `.env.example`, client/identity
   helpers (`armoriq/client_setup.py`), and a smoke test (`scripts/armoriq_smoke_test.py`) that passes in
   local-only mode. Network steps verified only up to a clean, clear failure without a real API key.
+- **Real incident infrastructure built and verified** — `auth-api` (FastAPI) in Docker with `/health`,
+  `/break`, `/fix`; a real `docker restart auth-api` recovers the service (proven by tests + manual run).
+  See `CURRENT_STATE.md` for details.
 - **Full agent workflow not implemented yet.**
 
 ## Current Status
@@ -103,13 +104,13 @@ plan proof, never on the text of the request and never on what an LLM intends.
 | Python environment + SDK install | **Implemented** (verified on Python 3.12, `armoriq-sdk 0.6.10`) |
 | Client/identity foundation | **Implemented** (`armoriq/client_setup.py`, keypair round-trip verified) |
 | SDK smoke test | **Implemented** (local path passes; network path needs a real key) |
-| Docker infrastructure | **Planned** |
+| Docker infrastructure (`auth-api` + compose + scripts) | **Implemented** (`docker-compose.yml`, `infrastructure/auth_api/`, `scripts/`) |
+| Infrastructure tests | **Implemented** (5 tests, all passing — health / break / real restart) |
 | MCP tools | **Planned** (wire format verified) |
 | Agent processes | **Planned** |
 | ArmorIQ plan/delegate/invoke wiring | **Planned** |
 | Database | **Planned** |
-| Tests | **Planned** |
-| Demo scripts | **Planned** |
+| Demo scripts | **Planned** (dev scripts done; `run_incident.sh` pending) |
 
 ## Setup
 
@@ -122,6 +123,22 @@ pip install -r requirements.txt
 # Configure
 copy .env.example .env            # Windows
 # then set ARMORIQ_API_KEY=ak_... (or run `armoriq login`)
+```
+
+## Local Development (Docker)
+
+Requires Docker (engine + Compose). Run the scripts from Git Bash (`C:\Program Files\Git\bin\bash.exe`):
+
+```bash
+scripts/start_env.sh        # build + start auth-api, wait until healthy
+scripts/check_health.sh     # GET /health
+scripts/break_service.sh    # POST /break  -> /health now returns 503
+scripts/restart_service.sh  # real `docker restart auth-api` -> recovers (the future remediation op)
+scripts/fix_service.sh      # POST /fix    -> app-level recovery without a restart
+scripts/reset_demo.sh       # compose down -v + up -d --build, back to clean state
+
+# Automated verification (from repo root):
+python -m pytest tests/test_infrastructure.py -v   # 5 tests, requires running Docker
 ```
 
 ## Demo
