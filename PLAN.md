@@ -11,6 +11,14 @@
 
 The plan below uses the **real, current** method signatures. Do not deviate from these without re-checking docs.armoriq.ai — the SDK is in Beta and can change.
 
+**Verification note (2026-08-19):** all four signatures below confirmed against the installed `armoriq-sdk 0.6.10` (introspected) and current docs. Small deltas found on the day:
+- `get_intent_token()` default `validity_seconds` is **60** (docs core-methods page); pass it explicitly (PLAN already does).
+- `delegate()` also accepts `target_agent` (optional) — not needed for our demo.
+- `MCPInvocationResult` fields are `mcp/action/result/status/execution_time/verified/metadata` (docs show a dict with `success`/`data` — use the object fields).
+- In 0.6.10 `PlanCapture` does not expose `plan_hash`/`merkle_root`/`ordered_paths` (docs show them); hashing happens server-side at `get_intent_token()`.
+- Client identity model confirmed: **one API key + per-request `for_user(email)`**; `user_id`/`agent_id` are deprecated in the current SDK (per-agent identity = separate process + separate Ed25519 keypair + per-agent email scope).
+- MCPs MUST be pre-registered on the platform (dashboard MCP Registry or `armoriq register` CLI) under the exact name used in plans, and MUST speak **JSON-RPC 2.0 over HTTP with SSE responses** (`initialize`, `tools/list`, `tools/call`) — the plain-HTTP wrapper fallback is not compatible with the proxy.
+
 ```python
 from armoriq_sdk import ArmorIQClient
 
@@ -144,7 +152,7 @@ Docker lifecycle (all scripted, see §19):
 | Diagnostic MCP | `inspect_config(service)` | Read current config/env of the service | `service: str` | config dict (redacted secrets) | Read-only | Diagnosis Agent | `docker inspect` / config file |
 | Remediation MCP | `restart_service(service)` | Actually restart the container | `service: str` | `{success, new_status}` | **Write** | Remediation Agent only (Diagnosis Agent will *attempt* it and be blocked) | `docker restart auth-api` |
 
-Each MCP is a tiny FastAPI/Flask process (or a minimal MCP-protocol server if you have time — a plain HTTP service the "MCP" wrapper calls is an acceptable simplification for a one-day hackathon, note this explicitly in the README as a scope cut). Keep each MCP under ~80 lines.
+Each MCP is a tiny FastAPI/Flask process (~80-100 lines) exposing `POST /mcp` in the **MCP Format Requirements** protocol (JSON-RPC 2.0, SSE responses, methods `initialize` / `tools/list` / `tools/call`). This protocol is required — the ArmorIQ proxy connects to MCPs over it, and each MCP must be registered on the platform under its exact name (`log-mcp`, `diagnostic-mcp`, `remediation-mcp`). Note: docs require a public HTTPS URL for registered MCPs — how our locally-run (Docker) MCPs get reached by the hosted proxy must be resolved before Phase 3 (tunnel / self-hosted proxy / direct).
 
 ---
 
@@ -153,7 +161,7 @@ Each MCP is a tiny FastAPI/Flask process (or a minimal MCP-protocol server if yo
 Do **not** implement four classes in one Python file. Minimum viable "separate agent" for a one-day hackathon:
 
 - Each agent is its **own Python process/script** (`agents/commander.py`, `agents/log_agent.py`, `agents/diagnosis_agent.py`, `agents/remediation_agent.py`), started independently (separate terminal or `docker compose` service, or a `honcho`/`Procfile`/simple `subprocess.Popen` launcher script).
-- Each agent process, on startup, **generates its own Ed25519 keypair** (`cryptography.hazmat.primitives.asymmetric.ed25519`) and holds its own `ArmorIQClient` instance (its own identity relative to ArmorIQ's user/agent model — check current `Client Initialization` docs for whether this is `agent_id` or `for_user(email)`-scoped in the current SDK version, since the docs show both patterns; verify on the day and pick the one that's live in the version you install).
+- Each agent process, on startup, **generates its own Ed25519 keypair** (`cryptography.hazmat.primitives.asymmetric.ed25519`) and holds its own `ArmorIQClient` instance. Verified on the day: the current SDK uses a **one-key, per-request-email** identity model — `ArmorIQClient(api_key=...)` per process, plus `for_user(email)` scopes. `user_id`/`agent_id` are deprecated (resolved per-request). Identity separation therefore = separate processes + separate keypairs (bound at `delegate()`) + a per-agent email (`commander@aegisops.local`, `diagnosis@aegisops.local`, ...) passed as `user_email` on every call.
 - Agents communicate over a simple transport: **HTTP (FastAPI) or a lightweight message queue (Redis pub/sub, or even just files/SQLite polling)** for "here's your delegated token, go do X." Pick HTTP — it's the fastest to build and debug, and it's realistic (each agent exposes one `/run_task` endpoint).
 - The Commander never calls Diagnosis/Remediation Agent's business logic directly in-process — it sends the delegated token + task over HTTP, and that agent process makes its own `invoke()` calls with its own client using its own keypair.
 

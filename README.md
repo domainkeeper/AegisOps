@@ -83,23 +83,46 @@ plan proof, never on the text of the request and never on what an LLM intends.
 - **LLM:** diagnosis rationale only (narrow, deterministic control flow)
 - **Transport:** HTTP between agents
 
+## Current Progress
+
+- **Architecture completed** — `PLAN.md` + `ARCHITECTURE.md` define the full system.
+- **ArmorIQ SDK verified** — package `armoriq-sdk 0.6.10` installed and confirmed against official docs:
+  client init, `capture_plan` / `get_intent_token` / `delegate` / `invoke`, exception model, proxy model,
+  MCP registration + wire format (JSON-RPC 2.0 over HTTP/SSE).
+- **Foundation established** — Python 3.12 venv, pinned `requirements.txt`, `.env.example`, client/identity
+  helpers (`armoriq/client_setup.py`), and a smoke test (`scripts/armoriq_smoke_test.py`) that passes in
+  local-only mode. Network steps verified only up to a clean, clear failure without a real API key.
+- **Full agent workflow not implemented yet.**
+
 ## Current Status
 
 | Area | Status |
 |---|---|
 | Plan | **Implemented** (`PLAN.md`) |
 | Architecture | **Implemented** (`ARCHITECTURE.md`) |
+| Python environment + SDK install | **Implemented** (verified on Python 3.12, `armoriq-sdk 0.6.10`) |
+| Client/identity foundation | **Implemented** (`armoriq/client_setup.py`, keypair round-trip verified) |
+| SDK smoke test | **Implemented** (local path passes; network path needs a real key) |
 | Docker infrastructure | **Planned** |
-| MCP tools | **Planned** |
+| MCP tools | **Planned** (wire format verified) |
 | Agent processes | **Planned** |
-| ArmorIQ integration | **Planned** |
+| ArmorIQ plan/delegate/invoke wiring | **Planned** |
 | Database | **Planned** |
 | Tests | **Planned** |
 | Demo scripts | **Planned** |
 
 ## Setup
 
-_Planned._ Will cover: copy `.env.example` → `.env`, install dependencies, `docker compose up -d`, and ArmorIQ API key setup.
+```bash
+# Requires Python 3.10 - 3.13 (armoriq-sdk does not support 3.14)
+python -m venv .venv
+.venv\Scripts\activate            # Windows
+pip install -r requirements.txt
+
+# Configure
+copy .env.example .env            # Windows
+# then set ARMORIQ_API_KEY=ak_... (or run `armoriq login`)
+```
 
 ## Demo
 

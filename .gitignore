@@ -4,9 +4,16 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Database
 *.db
+
+# Agent keypairs (identity material - never commit)
+.keys/
+
+# ArmorIQ CLI credentials
+.armoriq/
 
 # Node / JS tooling (only if used)
 node_modules/

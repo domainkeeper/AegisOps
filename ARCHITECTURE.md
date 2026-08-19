@@ -217,10 +217,12 @@ The Diagnosis Agent's attempt and the Remediation Agent's call are byte-identica
 
 ## 7. MCP Architecture
 
-Three tiny MCP services (target <~80 lines each; if the full MCP protocol costs too much for one day, plain
-HTTP services acting as MCP wrappers are the documented, judge-acceptable fallback — note it in README as a
-scope cut, PLAN §4). No authorization logic lives in the MCPs; they trust that the proxy already verified the
-caller.
+Three tiny MCP services. **Wire format verified (2026-08-19): the ArmorIQ proxy speaks JSON-RPC 2.0 over HTTP
+with SSE responses** — each MCP exposes `POST /mcp` implementing `initialize`, `tools/list`, `tools/call`
+(`tools/call` returns `content: [{type: "text", text: <JSON string>}]`). MCPs must be **registered on the
+platform** under the exact name used in plans/invokes. The original "plain HTTP service" fallback is NOT viable;
+the internal tool logic stays thin (~80-100 lines per MCP), but the wire protocol is fixed by ArmorIQ. No
+authorization logic lives in the MCPs; they trust that the proxy already verified the caller.
 
 ### 7.1 Tool inventory
 
@@ -236,49 +238,101 @@ caller.
 ## 8. ArmorIQ Architecture
 
 ArmorIQ is the **source of truth for cryptographic authorization**. We do not implement any of this — we call
-the SDK. All SDK specifics below are conceptual; exact signatures/behavior must be checked against
-`docs.armoriq.ai` on implementation day.
+the SDK. Facts below were verified on 2026-08-19 against `docs.armoriq.ai` (current docs) **and** the installed
+`armoriq-sdk 0.6.10` (signatures introspected from the installed package). Anything not yet confirmed is marked
+`UNVERIFIED`.
 
-### 8.1 Concepts
+### 8.1 Verified — SDK package & environment
+
+| Item | Verified fact |
+|---|---|
+| Package | `armoriq-sdk` on PyPI; ships the `armoriq_sdk` library **and** the `armoriq` CLI in one install |
+| Version installed | `0.6.10` (Beta). |
+| Python support | `>=3.10, <3.14`. **Python 3.14 is NOT supported** — project venv uses Python 3.12.10 |
+| CLI commands | `login`, `logout`, `whoami`, `init`, `validate`, `register`, `status`, `logs`, `orgs`, `switch-org`, `keys`, `policy`. `login` is browser OAuth device-code → writes `~/.armoriq/credentials.json` |
+| Client init | `ArmorIQClient(api_key=...)`; also `ArmorIQClient()` reading `ARMORIQ_API_KEY` env or credentials file; also `ArmorIQClient.from_config("armoriq.yaml")`. Constructor (verified): `(iap_endpoint, proxy_endpoint, backend_endpoint, proxy_endpoints, user_id, agent_id, context_id, timeout=30.0, max_retries=3, verify_ssl=True, api_key, use_production=True, mcp_credentials, iap_public_key)` |
+| Identity model | **One-key, per-request-email model.** `user_id`/`agent_id` are deprecated in the current SDK (resolved per-request from API key + email). Per-user scoping via `client.for_user(email)`. API key must start `ak_live_` / `ak_test_` / `ak_claw_`; missing/malformed key → `ConfigurationException` |
+
+### 8.2 Verified — API signatures (introspected from installed 0.6.10)
+
+| Method | Verified signature | Notes |
+|---|---|---|
+| `capture_plan` | `capture_plan(llm: str, prompt: str, plan: dict | None = None, metadata: dict | None = None) -> PlanCapture` | **Local, no network.** Plan dict must contain `steps`; empty/malformed plans rejected. In 0.6.10 `PlanCapture` exposes only `plan/llm/prompt/metadata` — `plan_hash`/`merkle_root`/`ordered_paths` shown in docs are NOT on the object (hashing happens server-side) |
+| `get_intent_token` | `get_intent_token(plan_capture: PlanCapture, policy: dict | None = None, validity_seconds: float = 60.0) -> IntentToken` | **Network.** Docs default validity is 60 s (short by design) — pass explicit validity. Raises `InvalidTokenException` (issuance failure), `PolicyBlockedException`. `IntentToken` fields (verified): `token_id, plan_hash, plan_id, signature, issued_at, expires_at, policy, composite_identity, client_info, policy_validation, step_proofs, total_steps, raw_token, jwt_token, policy_snapshot, subtree_delegation` |
+| `invoke` | `invoke(mcp: str, action: str, intent_token: IntentToken, params: dict | None = None, merkle_proof: list | None = None, user_email: str | None = None) -> MCPInvocationResult` | **Network.** `merkle_proof` auto-generated when omitted. Raises `IntentMismatchException` (action not part of the plan / step-verification failure), `TokenExpiredException`, `MCPInvocationException`. `MCPInvocationResult` fields (verified, differ from docs' dict shape): `mcp, action, result, status, execution_time, verified, metadata` |
+| `delegate` | `delegate(intent_token: IntentToken, delegate_public_key: str, validity_seconds: int = 3600, allowed_actions: list | None = None, target_agent: str | None = None, subtask: dict | None = None) -> DelegationResult` | **Network.** `delegate_public_key` = Ed25519 public key, **raw-bytes hex** (64 hex chars). Raises `DelegationException`. `DelegationResult` fields (verified): `delegation_id, delegated_token, delegate_public_key, target_agent, expires_at, trust_delta, status, metadata`. Security properties (docs): cryptographically bound, non-transferable, time-limited, action-restricted, auditable, revocable |
+| `invoke_with_policy` | `invoke_with_policy(mcp, action, intent_token, params=None, options: InvokeOptions | None = None)` | For hold/approval flows — not needed for the MVP; noted for completeness |
+
+### 8.3 Verified — Proxy & MCP connectivity
+
+| Item | Verified fact |
+|---|---|
+| What the Proxy is | A **hosted, stateless reverse proxy** (part of the ArmorIQ platform; self-hosting exists as an option). Intercepts all traffic between SDKs and MCP servers; has no database |
+| What it does per `invoke()` | Authenticates the request (API key / JWT / CSRG proof headers: `X-API-Key`, `X-CSRG-Path`, `X-CSRG-Value-Digest`, `X-CSRG-Proof`) → resolves target URL from token claims or dynamic MCP lookup → enforces policies → verifies the step via backend IAP + CSRG Merkle proof → forwards to the MCP → supports SSE streaming → creates audit log |
+| Token issuance | `get_intent_token` → `POST /token/issue` via proxy → CSRG-IAP builds Merkle tree, computes SHA-256 hash of canonical plan, signs Ed25519 → token with `plan_hash` + `merkle_root` returned |
+| MCP pre-registration | **REQUIRED.** MCPs must be registered on the platform (MCP Registry: dashboard "Add MCP", or the `armoriq register` CLI). The MCP name in SDK calls must match the registered name exactly |
+| MCP wire format | **JSON-RPC 2.0 over HTTP, SSE responses.** `POST /mcp`; methods `initialize`, `tools/list`, `tools/call`; response `event: message\ndata: {jsonrpc}\n\n`; `tools/call` result content items `{type: "text", text: <JSON string>}`. The "plain HTTP service" fallback in the original architecture is **NOT viable** — the proxy speaks this protocol to reach tools |
+| MCP deployment | Docs require a public HTTPS URL for registered MCPs — `UNVERIFIED` whether a locally-hosted MCP (Docker on the demo machine) can be reached by the hosted proxy, or whether the `proxy_endpoints` per-MCP override routes differently. **Resolve before Phase 3** (may need a tunnel/ngrok or self-hosted proxy) |
+
+### 8.4 Verified — errors & blocked actions
+
+| Case | Verified behavior |
+|---|---|
+| Action not in captured plan | `IntentMismatchException` (step-verification failure at proxy) |
+| Tool not in policy allow-list | `PolicyBlockedException` |
+| Token expired | `TokenExpiredException` |
+| Token/plan mismatch | `InvalidTokenException` |
+| Delegation denied | `DelegationException` |
+| MCP server error | `MCPInvocationException` |
+| Delegated token lacking an allowed action (the Diagnosis Agent beat) | `UNVERIFIED` — either `IntentMismatchException` or `PolicyBlockedException`; confirm at runtime in Phase 8 and handle both. Blocked path is exception-based, not a `success: false` result |
+| All exceptions inherit | `ArmorIQException` |
+
+### 8.5 Unverified / open items
+
+- Whether the hosted proxy can reach MCPs running locally in Docker for the demo (§8.3).
+- Which exception a scope-violating delegated token raises (§8.4).
+- Whether `agent_id` still has any effect in 0.6.10 despite deprecation (constructor accepts it).
+- Real-key network path: `get_intent_token()` / `invoke()` / `delegate()` end-to-end with a live `ARMORIQ_API_KEY` (smoke test full mode needs one).
+
+### 8.6 Delegation & authorization design (unchanged)
 
 | Concept | Role in AegisOps |
 |---|---|
-| **Agent registration / identities** | Each of the 4 processes is its own identity with its own `ArmorIQClient`. `VERIFY AGAINST ARMORIQ SDK`: whether identity is `agent_id`-scoped or `for_user(email)`-scoped in the installed SDK version (docs show both patterns, PLAN §5). |
-| **Keypairs** | Each process generates its own Ed25519 keypair at startup (`cryptography`). Public keys are handed to the Commander for `delegate()`; private keys never leave their process. |
-| **`capture_plan()`** | Does **not** call an LLM. The Commander supplies the explicit `goal` + `steps` structure naming our onboarded MCPs/actions. The plan is a deliberate artifact we control. `VERIFY AGAINST ARMORIQ SDK`: whether the MCPs must be pre-registered on `platform.armoriq.ai` first. |
-| **`get_intent_token()`** | Canonicalizes the plan → `plan_hash` → Merkle tree over steps → signed (Ed25519) → root intent token + per-step `step_proofs`. |
-| **`delegate()`** | Mints a new, restricted, non-transferable, time-limited token bound to the delegate's public key, with an explicit `allowed_actions` allow-list and a shorter validity window than the parent; returns `delegation_id` + `trust_delta`. Children never self-escalate — only the Commander calls `delegate()`. |
-| **`invoke()`** | Each call is verified at the ArmorIQ Proxy: Merkle proof, CSRG path, value digest, token signature, and scope. Allowed → forwarded to the MCP. Not in scope → `IntentMismatchException` / blocked result. `VERIFY AGAINST ARMORIQ SDK`: exact shape of the blocked response (exception vs `success: false`) so error handling matches reality. |
-| **Authorization enforcement** | Keyed on the signed token/allow-list, never on action-name strings. Renaming `restart_service` → `svc_bounce_x92` in both places changes nothing (PLAN §2). |
-| **Blocked actions** | Anything outside the presented token's `allowed_actions` / plan proof — e.g. Diagnosis Agent → `restart_service`. |
-| **Allowed actions** | Exactly what the presented token's allow-list contains — e.g. Remediation Agent → `restart_service`. |
-| **Audit trail** | ArmorIQ keeps the platform-side tamper-evident audit. We mirror every `delegate()`/`invoke()` result into our local `audit_events` table for the demo trail (PLAN §7). |
+| **Agent identities** | Each of the 4 processes runs its own `ArmorIQClient` (own API key usage) and its own Ed25519 keypair. With the one-key/for_user model, per-agent identity is carried by: separate processes + separate keypairs (bound at `delegate()`) + a per-agent email (`commander@aegisops.local`, etc.) passed as `user_email` for audit/policy scoping |
+| **Keypairs** | Each process generates its own Ed25519 keypair at startup (`cryptography`, mechanism verified: `armoriq/client_setup.py`). Public keys (raw-bytes hex) are handed to the Commander for `delegate()`; private keys never leave their process |
+| **`capture_plan()`** | Does **not** call an LLM. The Commander supplies the explicit `goal` + `steps` structure naming our registered MCPs/actions. Verified local, no network |
+| **`get_intent_token()`** | Proxy/IAP canonicalizes the plan → `plan_hash` → Merkle tree → signed token + per-step proofs (returned on the `IntentToken`) |
+| **`delegate()`** | Mints a new, restricted, non-transferable, time-limited token bound to the delegate's public key, with explicit `allowed_actions`; returns `delegation_id` + `trust_delta`. Children never self-escalate — only the Commander calls `delegate()` |
+| **`invoke()`** | Verified at the proxy: Merkle proof, CSRG path, value digest, token signature, scope. Allowed → forwarded to the MCP. Not in scope → exception (see §8.4) |
+| **Authorization enforcement** | Keyed on the signed token/allow-list, never on action-name strings. Renaming `restart_service` → `svc_bounce_x92` in both places changes nothing (PLAN §2) |
+| **Blocked actions** | Anything outside the presented token's `allowed_actions` / plan proof — e.g. Diagnosis Agent → `restart_service` |
+| **Allowed actions** | Exactly what the presented token's allow-list contains — e.g. Remediation Agent → `restart_service` |
+| **Audit trail** | ArmorIQ keeps the platform-side audit log. We mirror every `delegate()`/`invoke()` result into our local `audit_events` table for the demo trail (PLAN §7) |
 
-### 8.2 Lifecycle diagram
+### 8.7 Lifecycle diagram
 
 ```mermaid
 flowchart LR
     subgraph Cmd["Commander process (K1)"]
-        CL1["ArmorIQClient"]
+        CL1["ArmorIQClient + for_user('commander@aegisops.local')"]
     end
     subgraph Cmd2["Child processes (K2, K3, K4)"]
-        CL2["ArmorIQClient each"]
+        CL2["ArmorIQClient each + per-agent email"]
     end
     subgraph AP["ArmorIQ platform"]
-        REG["agent identities / registration"]
-        CAP["capture_plan(goal + steps)"]
-        TOK["get_intent_token → plan_hash, Merkle proofs, root token"]
-        DEL["delegate → scoped tokens + delegation_id"]
-        CHK["invoke verification<br/>proof + scope + signature"]
+        REG["MCP registration (registry / armoriq register)"]
+        CAP["capture_plan(goal + steps) — local"]
+        TOK["get_intent_token → POST /token/issue → plan_hash, Merkle proofs, signed token"]
+        DEL["delegate → POST /delegation/create → scoped tokens + delegation_id"]
+        CHK["invoke → POST /invoke<br/>CSRG headers, proof + scope + signature"]
         AUD["tamper-evident audit log"]
     end
-    subgraph Tools["MCPs"]
+    subgraph Tools["MCPs (JSON-RPC 2.0 + SSE)"]
         M1["log-mcp"]
         M2["diagnostic-mcp"]
         M3["remediation-mcp"]
     end
 
-    CL1 --> REG
     CL1 --> CAP --> TOK --> DEL
     DEL --> CL2
     CL2 --> CHK
@@ -286,12 +340,11 @@ flowchart LR
     CHK -->|"allowed"| M1
     CHK -->|"allowed"| M2
     CHK -->|"allowed"| M3
-    CHK -.->|"blocked"| CL2
+    CHK -.->|"blocked (exception)"| CL2
+    REG -.->|"registered URL"| M1
+    REG -.->|"registered URL"| M2
+    REG -.->|"registered URL"| M3
 ```
-
-`VERIFY AGAINST ARMORIQ SDK` (all of §0 in PLAN.md): exact signatures of `capture_plan` / `get_intent_token` /
-`delegate` / `invoke`, the `armoriq-sdk` PyPI package name/version, MCP pre-registration requirement, and the
-blocked-response shape. Do not invent SDK APIs.
 
 ---
 
@@ -443,7 +496,8 @@ AegisOps/
 │   ├── diagnostic_mcp.py     # get_service_status + inspect_config tools
 │   └── remediation_mcp.py    # restart_service tool
 ├── armoriq/
-│   └── client_setup.py       # Shared helper: ARMORIQ_API_KEY loading, keypair helpers
+│   ├── __init__.py            # package exports
+│   └── client_setup.py        # env loading, ARMORIQ_API_KEY validation, client factory, Ed25519 keypair helpers
 ├── infrastructure/
 │   ├── auth_api/
 │   │   └── main.py           # Tiny FastAPI app: /health, /break, /fix
@@ -456,13 +510,15 @@ AegisOps/
 │   ├── test_authorization.py # Security path (blocked) + happy path (allowed) — critical
 │   └── test_e2e.py           # Full incident flow + final health assertion
 ├── scripts/
-│   ├── start_env.sh          # compose up + wait for health
-│   ├── break_service.sh      # POST /break
-│   ├── run_incident.sh       # Kick off Commander with hardcoded incident
-│   └── reset_demo.sh         # POST /fix + clear SQLite rows
-├── .env.example              # ARMORIQ_API_KEY placeholder — never the real .env
-├── .gitignore
-├── docker-compose.yml        # auth-api (+ optional postgres)
+│   ├── armoriq_smoke_test.py  # SDK smoke test (Phase 1): local checks + optional network checks
+│   ├── start_env.sh           # compose up + wait for health
+│   ├── break_service.sh       # POST /break
+│   ├── run_incident.sh        # Kick off Commander with hardcoded incident
+│   └── reset_demo.sh          # POST /fix + clear SQLite rows
+├── .env.example               # ARMORIQ_API_KEY placeholder + optional endpoint overrides — never the real .env
+├── .gitignore                 # .env, .venv, .keys/, .armoriq/, *.db, __pycache__
+├── .keys/                     # (gitignored) per-agent Ed25519 keypairs: <agent>.pem + <agent>.pub
+├── docker-compose.yml         # auth-api (+ optional postgres)
 ├── requirements.txt
 ├── README.md                 # Public-facing introduction
 ├── PLAN.md                   # Source of truth: what we build
@@ -470,7 +526,8 @@ AegisOps/
 └── CURRENT_STATE.md          # Living status: where the project stands
 ```
 
-Placeholder-only files currently exist for every directory (`.gitkeep`); no implementation code exists.
+Phase 1 status: `armoriq/client_setup.py`, `armoriq/__init__.py`, and `scripts/armoriq_smoke_test.py` exist;
+all other directories still contain only `.gitkeep` placeholders. Agent/MCP/infrastructure code does not exist yet.
 
 ---
 
@@ -483,29 +540,37 @@ Placeholder-only files currently exist for every directory (`.gitkeep`); no impl
 | 3 | `capture_plan()` receives an explicit plan artifact we construct | SDK does not invent plans; makes the plan a deliberate, auditable artifact | PLAN §0 |
 | 4 | Unauthorized-attempt control flow is deterministic (hardcoded), LLM only produces rationale text | 100% reproducible demo | PLAN §8 |
 | 5 | Local SQLite is a thin mirror; ArmorIQ is the source of truth | Demo trail works offline/flaky-network | PLAN §7 |
-| 6 | MCPs are plain HTTP services wrapping tools (real MCP protocol optional) | One-day scope; documented as a judge-acceptable cut | PLAN §4, §20 |
+| 6 | **CHANGED (verified):** MCPs must speak JSON-RPC 2.0 over HTTP/SSE and be registered on the platform; plain-HTTP fallback removed | The ArmorIQ proxy connects to MCPs via this protocol; a non-compliant endpoint cannot be invoked | MCP Format Requirements, verified 2026-08-19 |
 | 7 | Commander dispatch may be hardcoded (safe cut); only Diagnosis LLM call is "must-have-ish" (SHOULD HAVE) | Timebox | PLAN §8, §14 |
 | 8 | Secrets in `.env` only; no Vault/KMS | Explicit DO-NOT-BUILD | PLAN §14 |
 | 9 | No generic agent framework; build exactly this scenario | Explicit DO-NOT-BUILD | PLAN §14 |
 | 10 | Trail viewer = minimal HTML page OR plain terminal/`audit_events` output | Option 2 only if Phase 10 time remains; Option 1 is judge-acceptable | PLAN §15 |
+| 11 | **NEW (verified):** venv on Python 3.12 — `armoriq-sdk` does not support 3.14 | PyPI requires `>=3.10,<3.14` | Verified 2026-08-19 |
+| 12 | **NEW (verified):** per-agent `user_email` (`commander@aegisops.local`, etc.) + per-process keypairs carry agent identity under the one-key/for_user model | `user_id`/`agent_id` deprecated in current SDK; identity = process + keypair + email scope | Client Initialization docs, verified 2026-08-19 |
 
 ---
 
 ## 15. Open Questions / Verification Items
 
-### VERIFY AGAINST ARMORIQ SDK (docs.armoriq.ai, on implementation day)
-- [ ] Exact package name/version (`armoriq-sdk` on PyPI) and install requirements.
-- [ ] Client initialization: `agent_id`-scoped vs `for_user(email)`-scoped in the installed version.
-- [ ] Must MCPs be pre-registered on `platform.armoriq.ai` before `capture_plan()`/`invoke()` accept them?
-- [ ] Current signatures of `capture_plan(llm, prompt, plan, metadata?)`, `get_intent_token(plan_capture)`, `delegate(intent_token, delegate_public_key, validity_seconds, allowed_actions, subtask?)`, `invoke(mcp, action, intent_token, params?, merkle_proof?, user_email?)`.
-- [ ] Shape of the "blocked" response from `invoke()` (exception vs `success: false`) for error handling.
-- [ ] Whether `get_intent_token()` returns the root token directly and whether `step_proofs` need explicit passing at `invoke()`.
+### Verified (2026-08-19, docs + installed armoriq-sdk 0.6.10)
+- [x] Package/version: `armoriq-sdk 0.6.10`, Python `>=3.10,<3.14`; CLI bundled (`armoriq`)
+- [x] Client init: `ArmorIQClient(api_key=...)` / env / credentials file / `from_config("armoriq.yaml")`; one-key + `for_user(email)` model
+- [x] MCP pre-registration required; name must match exactly; wire format JSON-RPC 2.0 + SSE
+- [x] Signatures of `capture_plan` / `get_intent_token(plan_capture, policy, validity_seconds=60.0)` / `delegate(..., target_agent, subtask)` / `invoke(..., merkle_proof auto, user_email)` (introspected)
+- [x] Blocked actions are exception-based: `IntentMismatchException` / `PolicyBlockedException` / `TokenExpiredException` / `InvalidTokenException` / `DelegationException` / `MCPInvocationException` (all `ArmorIQException`)
+- [x] `step_proofs` returned on the `IntentToken`; `merkle_proof` at `invoke()` auto-generated
+
+### Still unverified
+- [ ] **Which exception a delegated-token scope violation raises** (Diagnosis Agent → `restart_service`): `IntentMismatchException` vs `PolicyBlockedException` — needs a runtime test with a real key
+- [ ] Whether the hosted proxy can reach MCPs running locally (Docker on the demo machine); format docs say public HTTPS — may need tunnel or self-hosted proxy
+- [ ] Full network path (`get_intent_token` → `delegate` → `invoke`) with a live API key
 
 ### DECISION NEEDED
 - [ ] Include the optional Postgres container for "real infra" flavor, or cut? (Default: cut unless time is ahead of schedule.)
 - [ ] Trail viewer: minimal HTML page vs terminal/`audit_events` output only? (Default: terminal; HTML only if Phase 10 has time.)
 - [ ] Include the malicious-log prompt-injection beat in the first demo run? (Default: yes — PLAN SHOULD HAVE.)
 - [ ] LLM failure fallback for Diagnosis Agent: report inconclusive and stop (no escalation)? (Default: yes.)
+- [ ] MCP connectivity for the demo: tunnel vs self-hosted proxy vs direct? (New — from proxy/MCP verification.)
 
 ---
 
@@ -515,9 +580,9 @@ Dependency-aware order from PLAN §13. Each phase is gated on the previous one:
 
 | # | Phase | Why this order |
 |---|---|---|
-| 1 | **Project skeleton** — `.gitignore`, `.env.example`, deps, compose skeleton, API key working | Foundation; everything else depends on it |
+| 1 | **Project skeleton** — `.gitignore`, `.env.example`, deps, compose skeleton, API key working — **DONE (2026-08-19)**: env on Python 3.12, SDK verified + installed (0.6.10), client/identity foundation (`armoriq/client_setup.py`), smoke test (`scripts/armoriq_smoke_test.py`, local path passes) | Foundation; everything else depends on it |
 | 2 | **Docker infrastructure** — `auth-api` with `/health` `/break` `/fix`; manual break/restart/heal | MCPs need a real target; proves the real-world effect first |
-| 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` (direct HTTP, curl-testable) | Agents need tools; tools need infra (Phase 2) |
+| 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` speaking **JSON-RPC 2.0 + SSE** (`initialize`/`tools/list`/`tools/call`), registered on the platform under exact names; resolve local-MCP connectivity first (§8.3) | Agents need tools; tools need infra (Phase 2) and registration |
 | 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
 | 5 | **ArmorIQ identities + plan** — per-agent keypairs; `capture_plan()` → `get_intent_token()` | The authorization layer's foundation |
 | 6 | **ArmorIQ delegation** — `delegate()` ×3 with correct `allowed_actions` | Tokens are the currency of Phase 7 |
