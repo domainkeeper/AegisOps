@@ -33,7 +33,7 @@ All invoke() calls pass through the ArmorIQ Proxy for verification before reachi
 | **User** | Operator / demo runner. Triggered via `scripts/break_service.sh` and `scripts/run_incident.sh`. |
 | **Core workflow** | Break service → Commander captures plan + delegates scoped tokens → Log Agent reads logs → Diagnosis Agent inspects status/config → Diagnosis Agent *attempts* restart (BLOCKED) → Commander delegates restart → Remediation Agent restarts (ALLOWED) → health verified → audit trail shown. |
 | **Agents** | Commander, Log, Diagnosis, Remediation — 4 separate processes, 4 separate Ed25519 keypairs, 4 separate ArmorIQ clients. |
-| **MCP tools** | `search_logs`, `get_service_status`, `inspect_config` (read-only), `restart_service` (write). |
+| **MCP tools** | `search_logs`, `get_service_status`, `inspect_service_state` (read-only), `restart_service` (write). |
 | **Real-world action** | `docker restart auth-api` — an actual container restart, observable via `/health` and container start time. |
 | **Authorization boundary** | Between the ArmorIQ Proxy and the MCPs. Every `invoke()` is checked against the signed, scoped token before the tool executes. |
 | **Deliberate scope violation** | Diagnosis Agent deterministically attempts `invoke("remediation-mcp", "restart_service", diag_token)` → blocked by ArmorIQ, logged as `blocked`. |
@@ -68,7 +68,7 @@ flowchart TB
     R -->|"invoke(remediation-mcp, restart_service, K4-token)"| P
 
     P -->|ALLOWED only| LM["Log MCP<br/>search_logs"]
-    P -->|ALLOWED only| DM["Diagnostic MCP<br/>get_service_status · inspect_config"]
+    P -->|ALLOWED only| DM["Diagnostic MCP<br/>get_service_status · inspect_service_state"]
     P -->|ALLOWED only| RM["Remediation MCP<br/>restart_service"]
 
     LM -->|"docker logs / log file"| S["auth-api container"]
@@ -89,10 +89,10 @@ flowchart TB
 |---|---|---|
 | **Commander Agent** | Build the explicit 4-step plan; `capture_plan()` → `get_intent_token()`; `delegate()` scoped tokens to Log, Diagnosis, and (post-diagnosis) Remediation agents; write `incidents` + `audit_events` rows; coordinate via HTTP. | Never calls MCP tools directly in-process; never runs child business logic itself. |
 | **Log Agent** | Receives token+task over HTTP; `invoke("log-mcp", "search_logs", ...)`; returns log lines. | Diagnosis, status checks, restart. |
-| **Diagnosis Agent** | `invoke("diagnostic-mcp", "get_service_status" | "inspect_config", ...)`; narrow LLM call for restart rationale; **deterministically attempts** the unauthorized `restart_service` call (demo centerpiece). | Restart authority. Its token never includes `restart_service`. |
+| **Diagnosis Agent** | `invoke("diagnostic-mcp", "get_service_status" | "inspect_service_state", ...)`; narrow LLM call for restart rationale; **deterministically attempts** the unauthorized `restart_service` call (demo centerpiece). | Restart authority. Its token never includes `restart_service`. |
 | **Remediation Agent** | Receives restart authority from Commander after diagnosis; `invoke("remediation-mcp", "restart_service", ...)`; verifies recovery. | Diagnostics, logs, decision-making. |
 | **Log MCP** | Exposes `search_logs(service, keyword, since)`. | Authorization (proxy's job). |
-| **Diagnostic MCP** | Exposes `get_service_status(service)`, `inspect_config(service)` (redacts secrets). | Authorization. |
+| **Diagnostic MCP** | Exposes `get_service_status(service)`, `inspect_service_state(service)` (runtime state, redacted). | Authorization. |
 | **Remediation MCP** | Exposes `restart_service(service)` → real `docker restart`. | Authorization; deciding who may call it. |
 | **ArmorIQ Proxy** | Authorizes every `invoke()` against the presented token; blocks non-scoped actions; records platform audit. | Business logic, tool implementation. |
 | **Docker `auth-api`** | Real service with `/health`, `/break`, `/fix`; in-memory state. | Authorization. |
@@ -131,7 +131,7 @@ task over HTTP. See PLAN.md §5.
 | **Output** | Log lines returned to Commander / carried into the diagnosis task. |
 | **Identity** | Own keypair `K2`; own `ArmorIQClient`. |
 | **Authority** | `search_logs` only (1 action). |
-| **Forbidden actions** | `get_service_status`, `inspect_config`, `restart_service` — not in its allow-list. |
+| **Forbidden actions** | `get_service_status`, `inspect_service_state`, `restart_service` — not in its allow-list. |
 | **MCP tools** | `log-mcp` → `search_logs`. |
 | **Who delegates to it** | Commander. |
 | **Out-of-scope attempt** | Blocked by proxy; logged as `blocked` (not part of the demo's core beat, but the same mechanism). |
@@ -141,12 +141,12 @@ task over HTTP. See PLAN.md §5.
 | Aspect | Definition |
 |---|---|
 | **Purpose** | Gather status + config, produce an LLM-backed rationale ("does this need a restart? yes/no + one sentence"), and — **deterministically** — attempt `restart_service` with its own token to demonstrate the block. |
-| **Input** | Delegated token (`allowed_actions=["get_service_status","inspect_config"]`) + task (including Log Agent's excerpts) over HTTP from Commander. |
+| **Input** | Delegated token (`allowed_actions=["get_service_status","inspect_service_state"]`) + task (including Log Agent's excerpts) over HTTP from Commander. |
 | **Output** | Diagnosis conclusion + rationale; a guaranteed `blocked` attempt; `audit_events` row(s). |
 | **Identity** | Own keypair `K3`; own `ArmorIQClient`. |
-| **Authority** | `get_service_status`, `inspect_config` — read-only diagnosis (2 actions). |
+| **Authority** | `get_service_status`, `inspect_service_state` — read-only diagnosis (2 actions). |
 | **Forbidden actions** | **`restart_service` — the hard boundary. Also `search_logs` is not delegated to it** (log evidence arrives via the task payload). |
-| **MCP tools** | `diagnostic-mcp` → `get_service_status`, `inspect_config`. |
+| **MCP tools** | `diagnostic-mcp` → `get_service_status`, `inspect_service_state`. |
 | **Who delegates to it** | Commander. |
 | **Out-of-scope attempt** | `invoke("remediation-mcp","restart_service", diag_token)` → **blocked by ArmorIQ Proxy** before reaching the MCP; container is NOT restarted; row logged with `authorization_result='blocked'`. This is the demo's centerpiece — never an error to hide (PLAN §10). |
 
@@ -172,7 +172,7 @@ task over HTTP. See PLAN.md §5.
 |---|---|---|---|---|
 | `search_logs` | ✓ (in plan) | **✓ allowed** | ✗ (not delegated) | ✗ (not delegated) |
 | `get_service_status` | ✓ (in plan) | ✗ | **✓ allowed** | ✗ |
-| `inspect_config` | ✓ (in plan) | ✗ | **✓ allowed** | ✗ |
+| `inspect_service_state` | ✓ (in plan) | ✗ | **✓ allowed** | ✗ |
 | `restart_service` | ✓ (in plan, never executes it in demo) | ✗ | ✗ — **attempts it, blocked** | **✓ allowed (post-diagnosis delegation)** |
 
 Key invariants:
@@ -192,7 +192,7 @@ Commander  ── capture_plan(goal + 4 steps) ──► ArmorIQ: signed plan (p
         │  ── get_intent_token() ──► root intent token (full 4-step authority)
         │
         ├─ delegate(token, K2, allowed=["search_logs"])                 ──► Log Agent (K2)     ──► search_logs
-        ├─ delegate(token, K3, allowed=["get_service_status","inspect_config"]) ──► Diagnosis Agent (K3) ──► status/config
+        ├─ delegate(token, K3, allowed=["get_service_status","inspect_service_state"]) ──► Diagnosis Agent (K3) ──► status/config
         └─ delegate(token, K4, allowed=["restart_service"])  [AFTER diagnosis]  ──► Remediation Agent (K4) ──► restart_service
 ```
 
@@ -217,21 +217,160 @@ The Diagnosis Agent's attempt and the Remediation Agent's call are byte-identica
 
 ## 7. MCP Architecture
 
-Three tiny MCP services. **Wire format verified (2026-08-19): the ArmorIQ proxy speaks JSON-RPC 2.0 over HTTP
-with SSE responses** — each MCP exposes `POST /mcp` implementing `initialize`, `tools/list`, `tools/call`
-(`tools/call` returns `content: [{type: "text", text: <JSON string>}]`). MCPs must be **registered on the
-platform** under the exact name used in plans/invokes. The original "plain HTTP service" fallback is NOT viable;
-the internal tool logic stays thin (~80-100 lines per MCP), but the wire protocol is fixed by ArmorIQ. No
-authorization logic lives in the MCPs; they trust that the proxy already verified the caller.
+**Implemented in Phase 3 (2026-08-19)**. Three MCP servers, each exposing narrowly scoped tools. The MCP layer
+defines **what capabilities exist**; ArmorIQ (later phases) decides **which agent is authorized** to use them;
+no authorization logic lives in the MCPs.
 
-### 7.1 Tool inventory
+### 7.1 Transport (verified)
 
-| # | MCP server | Tool | Owning agent | Purpose | Input | Output | Read/Write | Underlying resource | Authorization | Failure behavior |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 1 | `log-mcp` | `search_logs` | Log Agent | Fetch recent log lines | `service: str`, optional `keyword`, `since` | List of log lines/dicts | Read-only | `docker logs auth-api` or mounted log file | Proxy-checked: only tokens with `search_logs` | Invalid args → 400-style error; agent logs and stops step |
-| 2 | `diagnostic-mcp` | `get_service_status` | Diagnosis Agent | Health/status check | `service: str` | `{status, http_code, uptime}` | Read-only | `auth-api` `/health` endpoint | Proxy-checked: tokens with `get_service_status` | Unhealthy service → returns unhealthy status (that's data, not failure) |
-| 3 | `diagnostic-mcp` | `inspect_config` | Diagnosis Agent | Read current config/env | `service: str` | Config dict, **secrets redacted** | Read-only | `docker inspect` / config file | Proxy-checked: tokens with `inspect_config` | Missing service → error result; agent logs and stops |
-| 4 | `remediation-mcp` | `restart_service` | Remediation Agent | Actually restart the container | `service: str` | `{success, new_status}` | **Write** | `docker restart auth-api` | Proxy-checked: tokens with `restart_service`; **Diagnosis Agent's attempt must be rejected here** | Docker failure → retry once, then report failure (PLAN §10) |
+| Item | Decision | Verified how |
+|---|---|---|
+| Protocol library | **Official MCP Python SDK** (`mcp==2.0.0`, PyPI, MIT) — the current stable release line; serves every protocol revision from one server | Installed + introspected; `MCPServer` + `mcp.run(transport="streamable-http")` |
+| Transport | **Streamable HTTP** (`POST /mcp`, SSE responses). This is the modern official transport and its wire format matches the ArmorIQ MCP Format Requirements byte-for-byte: JSON-RPC 2.0 over HTTP, `Content-Type: text/event-stream`, `event: message` + `data: {jsonrpc}`, methods `initialize` / `tools/list` / `tools/call`, tool results `content: [{type: "text", text: "<JSON string>"}]` | Raw HTTP probe test (`tests/test_mcp_spike.py::test_wire_format_is_armoriq_compatible_sse`) |
+| Session handling | 2025-era clients must echo the `Mcp-Session-Id` header returned by `initialize` on subsequent calls (standard streamable HTTP behavior; the SDK `Client` does this automatically, the dev scripts do it explicitly) | `scripts/discover_tools.sh` / `call_mcp_tool.sh` |
+| Protocol methods | `initialize`, `tools/list`, `tools/call` (2025-era handshake, which ArmorIQ requires); the same server also answers 2026-era clients | Client probe + raw wire tests |
+| Server identity | Names registered under `log-mcp`, `diagnostic-mcp`, `remediation-mcp` (exact names ArmorIQ registration must match) | `MCPServer(name=...)` |
+
+The Phase 2 note "the plain HTTP fallback is NOT viable" is resolved: the official SDK's streamable HTTP
+transport IS the required format — no custom protocol code needed.
+
+### 7.2 Connectivity decision
+
+Verified against current official ArmorIQ docs (`docs.armoriq.ai`, checked 2026-08-19):
+
+- **ArmorIQ MCP Format Requirements** require a **public HTTPS URL** for registered MCPs, with authentication
+  and "production-ready" error handling. The hosted proxy resolves the target URL from the registration
+  (dashboard / `armoriq register`) or per-MCP overrides (`proxy_endpoints` in the SDK config / `mcp_servers`
+  in `armoriq.yaml`).
+- **Localhost is NOT reachable from the hosted proxy.** `localhost` only works with a client running on the
+  same host (local development, the SDK `Client`, or a self-hosted ArmorIQ stack).
+- **Self-hosting ArmorIQ is officially supported** (`docs.armoriq.ai/platform/self-hosting`; the SDK supports
+  `use_production=False` + local endpoints, and `ARMORIQ_ENV=local` flips all endpoints to localhost). A
+  self-hosted proxy on the same machine CAN reach MCPs on localhost.
+- **Tunnels are a documented deployment concern, not app code.** Exposing a local MCP to the hosted proxy
+  requires a public HTTPS tunnel (e.g. ngrok/cloudflared) — provider choice is a deployment decision, never
+  hardcoded into the application.
+
+**Selected architecture for AegisOps:**
+
+| Mode | Setup | Used for |
+|---|---|---|
+| **Local development** | MCPs on `127.0.0.1:8081-8083`; talk to them with the SDK `Client`, `scripts/call_mcp_tool.sh`, or the tests. No ArmorIQ needed. | Day-to-day dev + Phase 3 verification + Phase 4 unguarded agents |
+| **ArmorIQ-connected (hosted proxy)** | Each MCP gets a public HTTPS URL via a tunnel (or a reachable deploy); register under the exact names; the proxy invokes them over the verified wire format. | The full authorized flow (Phases 5-9) |
+| **ArmorIQ-connected (self-hosted proxy)** | Run the ArmorIQ stack locally (`use_production=False`, proxy on localhost) — officially supported; proxy reaches the MCPs directly on localhost. | Fallback if hosted registration/tunnel is unavailable |
+
+### 7.3 Server boundaries
+
+| MCP server | Module | Port | Capability | Nature |
+|---|---|---|---|---|
+| `log-mcp` | `mcp_servers/log_mcp.py` | 8081 | `search_logs` | Read-only |
+| `diagnostic-mcp` | `mcp_servers/diagnostic_mcp.py` | 8082 | `get_service_status`, `inspect_service_state` | Read-only |
+| `remediation-mcp` | `mcp_servers/remediation_mcp.py` | 8083 | `restart_service` | **Write** (the only write tool in the system) |
+
+Package name note: the local package is `mcp_servers/` (not `mcp/`) because the official SDK ships a package
+named `mcp` — the local directory must not shadow it.
+
+### 7.4 Tool schemas
+
+All schemas are explicit (generated from the tool signatures, visible via `tools/list`); a service name is
+always resolved through the `SERVICES` allowlist map (`mcp_servers/common.py`, currently only
+`auth-api` → container `auth-api`) — never interpolated into a shell string.
+
+#### `log-mcp.search_logs(service, keyword=None, since=None, limit=50)`
+
+| Aspect | Definition |
+|---|---|
+| Description | Return recent log lines for a service (read-only; `docker logs` backed — the log source is auth-api's stdout per PLAN §3) |
+| Parameters | `service: str` **required**; `keyword: str?` (substring filter); `since: str?` (docker `--since`, e.g. `10m` or RFC3339); `limit: int = 50` (1-500) |
+| Validation | service on allowlist → else ToolError; limit must be int in 1..500 |
+| Return | `{"service", "count", "lines": [...]}` (JSON string in the `text` content item) |
+| Errors | unknown service; docker CLI unavailable; docker logs failure (stderr included) |
+| Side effects | None |
+| Security sensitivity | Read-only; no filesystem access, no SQL, no shell |
+
+#### `diagnostic-mcp.get_service_status(service)`
+
+| Aspect | Definition |
+|---|---|
+| Description | Live `/health` state of a service; unhealthy is returned as data, never as failure |
+| Parameters | `service: str` **required** |
+| Validation | allowlist |
+| Return | `{"service", "http_code", "status", "uptime_seconds"}` |
+| Errors | unknown service; auth-api unreachable |
+| Side effects | None |
+| Security sensitivity | Read-only; the Diagnosis Agent's main tool |
+
+#### `diagnostic-mcp.inspect_service_state(service)`
+
+| Aspect | Definition |
+|---|---|
+| Description | Container runtime state from `docker inspect` — secret-bearing fields (env, config, args) are NOT included |
+| Parameters | `service: str` **required** |
+| Validation | allowlist |
+| Return | `{"service", "running", "started_at", "restart_count", "health_status", "image"}` |
+| Errors | unknown service; container missing; parse failure |
+| Side effects | None |
+| Security sensitivity | Read-only, redacted output |
+
+#### `remediation-mcp.restart_service(service_name)`
+
+| Aspect | Definition |
+|---|---|
+| Description | Restart a service **for real** (`docker restart <container>`) and wait until `/health` recovers (30s window) |
+| Parameters | `service_name: str` **required** |
+| Validation | **explicit allowlist** (`auth-api` only); anything else rejected — including `"auth-api; rm -rf /"`, `"postgres"`, `""` |
+| Return | `{"service", "operation": "restart_service", "success", "container", "started_at_before", "started_at", "health"}` |
+| Errors | unknown service; docker CLI unavailable; docker restart failure (stderr); recovery timeout |
+| Side effects | **Real Docker restart** — container start time changes, in-memory state reset |
+| Security sensitivity | The only write capability in the system; single-purpose by construction — no `run_shell` / `docker_exec` / `run_command` / `bash` tool exists anywhere in the MCP layer |
+
+### 7.5 Security model (Phase 3)
+
+- **MCP = capability**: each server exposes only its narrow tools; there is no generic shell/command escape hatch.
+- **ArmorIQ = authorization** (future phases): decides whether THIS agent may invoke a capability, via
+  delegated tokens. The MCPs perform no agent checks — that would be a fake boundary.
+- **Explicit allowlist**: service names are resolved through `SERVICES` only; `subprocess` calls use fixed
+  argument lists, never `shell=True`, never string interpolation.
+- **Read/write split**: only `remediation-mcp` writes; the Diagnosis Agent's tool surface is read-only by
+  construction, which is what makes the Phase 8 blocked-restart demonstration meaningful.
+
+### 7.6 Intended agent → capability mapping (documented, NOT enforced in code)
+
+| Agent (Phase 4+) | Allowed MCPs | Tools | Forbidden |
+|---|---|---|---|
+| Log Agent | `log-mcp` | `search_logs` | diagnostic + remediation MCPs |
+| Diagnosis Agent | `diagnostic-mcp` (+ log results via task payload) | `get_service_status`, `inspect_service_state` | **`remediation-mcp`** — will attempt `restart_service` and be blocked by ArmorIQ |
+| Remediation Agent | `remediation-mcp` | `restart_service` | diagnostic + log MCPs |
+
+Enforcement happens at the ArmorIQ layer via delegated `allowed_actions`, never inside the MCP code.
+
+### 7.7 Diagram
+
+```mermaid
+flowchart LR
+    subgraph Agents["agents (later phases)"]
+        LA["Log Agent"]
+        DA["Diagnosis Agent"]
+        RA["Remediation Agent"]
+    end
+    subgraph MCPs["MCP layer - Phase 3, implemented"]
+        LM["log-mcp :8081<br/>search_logs"]
+        DM["diagnostic-mcp :8082<br/>get_service_status · inspect_service_state"]
+        RM["remediation-mcp :8083<br/>restart_service (allowlist: auth-api)"]
+    end
+    subgraph Infra["real infrastructure"]
+        API["auth-api :8080<br/>/health · /break · /fix"]
+        DK["Docker"]
+    end
+
+    LA -->|"tools/call"| LM
+    DA -->|"tools/call"| DM
+    RA -->|"tools/call"| RM
+    LM -->|"docker logs"| API
+    DM -->|"GET /health · docker inspect"| API
+    RM -->|"docker restart auth-api"| DK
+    DK --> API
+```
 
 ---
 
@@ -272,7 +411,7 @@ the SDK. Facts below were verified on 2026-08-19 against `docs.armoriq.ai` (curr
 | Token issuance | `get_intent_token` → `POST /token/issue` via proxy → CSRG-IAP builds Merkle tree, computes SHA-256 hash of canonical plan, signs Ed25519 → token with `plan_hash` + `merkle_root` returned |
 | MCP pre-registration | **REQUIRED.** MCPs must be registered on the platform (MCP Registry: dashboard "Add MCP", or the `armoriq register` CLI). The MCP name in SDK calls must match the registered name exactly |
 | MCP wire format | **JSON-RPC 2.0 over HTTP, SSE responses.** `POST /mcp`; methods `initialize`, `tools/list`, `tools/call`; response `event: message\ndata: {jsonrpc}\n\n`; `tools/call` result content items `{type: "text", text: <JSON string>}`. The "plain HTTP service" fallback in the original architecture is **NOT viable** — the proxy speaks this protocol to reach tools |
-| MCP deployment | Docs require a public HTTPS URL for registered MCPs — `UNVERIFIED` whether a locally-hosted MCP (Docker on the demo machine) can be reached by the hosted proxy, or whether the `proxy_endpoints` per-MCP override routes differently. **Resolve before Phase 3** (may need a tunnel/ngrok or self-hosted proxy) |
+| MCP deployment | Docs require a public HTTPS URL for registered MCPs. **RESOLVED (Phase 3):** localhost is NOT reachable from the hosted proxy; local development talks to MCPs directly on localhost; the ArmorIQ-connected modes are (a) public HTTPS tunnel to the local MCP or (b) a self-hosted ArmorIQ stack (`use_production=False` / `ARMORIQ_ENV=local`, proxy on localhost) which can reach local MCPs directly. Tunnel provider choice stays a deployment concern, not app code. See §7.2 |
 
 ### 8.4 Verified — errors & blocked actions
 
@@ -501,14 +640,16 @@ Per PLAN.md §12, plus the three project documents at root:
 ```
 AegisOps/
 ├── agents/
-│   ├── commander.py          # Process 1: plan capture, tokens, delegation, orchestration
-│   ├── log_agent.py          # Process 2: search_logs via log-mcp
-│   ├── diagnosis_agent.py    # Process 3: status/config + LLM rationale + deterministic blocked attempt
-│   └── remediation_agent.py  # Process 4: authorized restart_service
-├── mcp/
-│   ├── log_mcp.py            # search_logs tool
-│   ├── diagnostic_mcp.py     # get_service_status + inspect_config tools
-│   └── remediation_mcp.py    # restart_service tool
+│   ├── commander.py          # Process 1: plan capture, tokens, delegation, orchestration (Phase 4+)
+│   ├── log_agent.py          # Process 2: search_logs via log-mcp (Phase 4+)
+│   ├── diagnosis_agent.py    # Process 3: status/config + LLM rationale + deterministic blocked attempt (Phase 4+)
+│   └── remediation_agent.py  # Process 4: authorized restart_service (Phase 4+)
+├── mcp_servers/              # MCP layer (Phase 3 - implemented). NOT named "mcp" (shadows the official SDK package)
+│   ├── common.py             # shared: MCPServer factory, SERVICES allowlist, docker/health helpers, ToolError
+│   ├── spike.py              # minimal transport spike: health_check tool, port 8090 (re-verification artifact)
+│   ├── log_mcp.py            # log-mcp :8081 - search_logs (read-only)
+│   ├── diagnostic_mcp.py     # diagnostic-mcp :8082 - get_service_status, inspect_service_state (read-only)
+│   └── remediation_mcp.py    # remediation-mcp :8083 - restart_service (write, allowlist-scoped)
 ├── armoriq/
 │   ├── __init__.py            # package exports
 │   └── client_setup.py        # env loading, ARMORIQ_API_KEY validation, client factory, Ed25519 keypair helpers
@@ -519,26 +660,33 @@ AegisOps/
 │   │   ├── Dockerfile        # python:3.12-slim, port 8080, HEALTHCHECK
 │   │   └── .dockerignore
 ├── database/
-│   ├── schema.sql            # incidents + audit_events DDL
-│   └── db.py                 # Thin sqlite3 wrapper
+│   ├── schema.sql            # incidents + audit_events DDL (Phase 7)
+│   └── db.py                 # Thin sqlite3 wrapper (Phase 7)
 ├── tests/
-│   ├── test_infrastructure.py # Phase 2: health/break/real-restart lifecycle
-│   ├── test_mcp_tools.py      # Direct MCP tool tests vs running container
-│   ├── test_authorization.py  # Security path (blocked) + happy path (allowed) — critical
-│   └── test_e2e.py            # Full incident flow + final health assertion
+│   ├── test_infrastructure.py # Phase 2: health/break/real-restart lifecycle (5 tests)
+│   ├── test_mcp_spike.py      # Phase 3: transport wire format + spike round-trip (4 tests)
+│   ├── test_mcp_tools.py      # Phase 3: all three MCPs, incl. real restart integration (13 tests)
+│   ├── test_authorization.py  # Phase 8: Security path (blocked) + happy path (allowed) — critical
+│   └── test_e2e.py            # Phase 10: Full incident flow + final health assertion
 ├── scripts/
 │   ├── armoriq_smoke_test.py  # SDK smoke test (Phase 1): local checks + optional network checks
+│   ├── spike_probe.py         # Phase 3: client probe for the transport spike (spike must be running)
 │   ├── start_env.sh           # compose up + wait for health
 │   ├── check_health.sh        # curl /health
 │   ├── break_service.sh       # POST /break
 │   ├── fix_service.sh         # POST /fix (app-level recovery)
 │   ├── restart_service.sh     # docker restart auth-api (the real remediation operation)
+│   ├── start_mcps.sh          # Phase 3: start the three MCP servers (background, PID files in logs/)
+│   ├── check_mcps.sh          # Phase 3: initialize handshake per MCP
+│   ├── discover_tools.sh      # Phase 3: tools/list for one MCP
+│   ├── call_mcp_tool.sh       # Phase 3: invoke one tool with JSON args
+│   ├── stop_mcps.sh           # Phase 3: stop the MCP servers
 │   ├── run_incident.sh        # (future) Kick off Commander with hardcoded incident
 │   └── reset_demo.sh          # compose down -v + up; (future) + clear SQLite rows
 ├── .env.example               # ARMORIQ_API_KEY placeholder + optional endpoint overrides — never the real .env
-├── .gitignore                 # .env, .venv, .keys/, .armoriq/, *.db, __pycache__
+├── .gitignore                 # .env, .venv, .keys/, .armoriq/, *.db, logs/, __pycache__
 ├── .keys/                     # (gitignored) per-agent Ed25519 keypairs: <agent>.pem + <agent>.pub
-├── docker-compose.yml         # auth-api (+ optional postgres)
+├── docker-compose.yml         # auth-api
 ├── requirements.txt
 ├── README.md                 # Public-facing introduction
 ├── PLAN.md                   # Source of truth: what we build
@@ -546,8 +694,12 @@ AegisOps/
 └── CURRENT_STATE.md          # Living status: where the project stands
 ```
 
-Phase 1 status: `armoriq/client_setup.py`, `armoriq/__init__.py`, and `scripts/armoriq_smoke_test.py` exist;
-all other directories still contain only `.gitkeep` placeholders. Agent/MCP/infrastructure code does not exist yet.
+Phase 1 status: `armoriq/client_setup.py`, `armoriq/__init__.py`, and `scripts/armoriq_smoke_test.py` exist.
+Phase 2 status: `infrastructure/auth_api/` (main.py, Dockerfile, requirements.txt, .dockerignore), root
+`docker-compose.yml`, six infra scripts, and `tests/test_infrastructure.py` exist.
+Phase 3 status: `mcp_servers/` (common, spike, log_mcp, diagnostic_mcp, remediation_mcp), MCP dev scripts,
+`tests/test_mcp_spike.py` + `tests/test_mcp_tools.py`, and `scripts/spike_probe.py` exist and pass.
+Agents (`agents/`), the database (`database/`), and authorization tests do not exist yet.
 
 ---
 
@@ -567,6 +719,11 @@ all other directories still contain only `.gitkeep` placeholders. Agent/MCP/infr
 | 10 | Trail viewer = minimal HTML page OR plain terminal/`audit_events` output | Option 2 only if Phase 10 time remains; Option 1 is acceptable | PLAN §15 |
 | 11 | **NEW (verified):** venv on Python 3.12 — `armoriq-sdk` does not support 3.14 | PyPI requires `>=3.10,<3.14` | Verified 2026-08-19 |
 | 12 | **NEW (verified):** per-agent `user_email` (`commander@aegisops.local`, etc.) + per-process keypairs carry agent identity under the one-key/for_user model | `user_id`/`agent_id` deprecated in current SDK; identity = process + keypair + email scope | Client Initialization docs, verified 2026-08-19 |
+| 13 | **NEW (Phase 2):** single root `docker-compose.yml` (no infra-local duplicate); `auth-api` uses in-memory state so a real restart is observable; Postgres cut (cosmetic only) | Implementation decision during Phase 2 | Phase 2 |
+| 14 | **NEW (Phase 2):** future Remediation MCP exposes narrowly scoped `restart_service("auth-api")` — fixed mapping, no generic `run_shell(command)` | Capability boundary must precede authorization | Phase 2 → implemented Phase 3 |
+| 15 | **NEW (Phase 3):** MCP layer uses the **official MCP Python SDK** (`mcp==2.0.0`), Streamable HTTP transport, SSE responses — NOT a hand-rolled protocol | The SDK's wire format matches ArmorIQ's MCP Format Requirements exactly; official + stable | Verified 2026-08-19 (raw wire probe + client round-trip) |
+| 16 | **NEW (Phase 3):** local package named `mcp_servers/`, not `mcp/` | `mcp` is the official SDK's package name — a local `mcp/` directory shadows it | Hit the collision during the spike |
+| 17 | **NEW (Phase 3):** local dev talks to MCPs on localhost directly; ArmorIQ-connected modes = public HTTPS tunnel (deployment concern, no provider hardcoded) OR self-hosted ArmorIQ stack (`use_production=False`); hosted proxy cannot reach localhost | Verified against official docs: registration requires public HTTPS; self-hosting is officially supported | docs.armoriq.ai, 2026-08-19 |
 
 ---
 
@@ -582,7 +739,7 @@ all other directories still contain only `.gitkeep` placeholders. Agent/MCP/infr
 
 ### Still unverified
 - [ ] **Which exception a delegated-token scope violation raises** (Diagnosis Agent → `restart_service`): `IntentMismatchException` vs `PolicyBlockedException` — needs a runtime test with a real key
-- [ ] Whether the hosted proxy can reach MCPs running locally (Docker on the demo machine); format docs say public HTTPS — may need tunnel or self-hosted proxy
+- [x] ~~Whether the hosted proxy can reach MCPs running locally~~ — **RESOLVED (Phase 3):** it cannot (localhost ≠ reachable); local = direct localhost client, ArmorIQ-connected = HTTPS tunnel or self-hosted proxy. See §7.2
 - [ ] Full network path (`get_intent_token` → `delegate` → `invoke`) with a live API key
 
 ### DECISION NEEDED
@@ -602,7 +759,7 @@ Dependency-aware order from PLAN §13. Each phase is gated on the previous one:
 |---|---|---|
 | 1 | **Project skeleton** — `.gitignore`, `.env.example`, deps, compose skeleton, API key working — **DONE (2026-08-19)**: env on Python 3.12, SDK verified + installed (0.6.10), client/identity foundation (`armoriq/client_setup.py`), smoke test (`scripts/armoriq_smoke_test.py`, local path passes) | Foundation; everything else depends on it |
 | 2 | **Docker infrastructure** — `auth-api` with `/health` `/break` `/fix`; manual break/restart/heal — **DONE (2026-08-19)**: FastAPI service + Dockerfile + root compose + 6 dev scripts; break → 503, real `docker restart auth-api` → healthy (start-time proven); 5/5 tests pass (§9) | MCPs need a real target; proves the real-world effect first |
-| 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` speaking **JSON-RPC 2.0 + SSE** (`initialize`/`tools/list`/`tools/call`), registered on the platform under exact names; resolve local-MCP connectivity first (§8.3) | Agents need tools; tools need infra (Phase 2) and registration |
+| 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` speaking **JSON-RPC 2.0 + SSE** (`initialize`/`tools/list`/`tools/call`), registered on the platform under exact names; resolve local-MCP connectivity first (§8.3) — **DONE (2026-08-19)**: official MCP SDK v2 (mcp==2.0.0), Streamable HTTP; connectivity resolved (§7.2: local = direct localhost, ArmorIQ = tunnel or self-hosted proxy); spike verified; 3 servers + 4 tools; 17/17 MCP tests pass incl. real restart | Agents need tools; tools need infra (Phase 2) and registration |
 | 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
 | 5 | **ArmorIQ identities + plan** — per-agent keypairs; `capture_plan()` → `get_intent_token()` | The authorization layer's foundation |
 | 6 | **ArmorIQ delegation** — `delegate()` ×3 with correct `allowed_actions` | Tokens are the currency of Phase 7 |

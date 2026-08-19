@@ -44,7 +44,7 @@ AEGIS_PLAN = {
     "steps": [
         {"action": "search_logs",        "mcp": "log-mcp",        "params": {"service": "auth-api"}},
         {"action": "get_service_status", "mcp": "diagnostic-mcp", "params": {"service": "auth-api"}},
-        {"action": "inspect_config",     "mcp": "diagnostic-mcp", "params": {"service": "auth-api"}},
+        {"action": "inspect_service_state",     "mcp": "diagnostic-mcp", "params": {"service": "auth-api"}},
         {"action": "restart_service",    "mcp": "remediation-mcp", "params": {"service": "auth-api"}},
     ],
 }

@@ -1,3 +1,4 @@
 armoriq-sdk==0.6.10
 python-dotenv==1.2.3
+mcp==2.0.0
 pytest==9.1.1

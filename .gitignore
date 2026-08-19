@@ -15,5 +15,9 @@ __pycache__/
 # ArmorIQ CLI credentials
 .armoriq/
 
+# Local runtime state
+logs/
+.pytest_cache/
+
 # Node / JS tooling (only if used)
 node_modules/
