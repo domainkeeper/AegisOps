@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Database
+*.db
+
+# Node / JS tooling (only if used)
+node_modules/
