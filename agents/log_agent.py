@@ -18,17 +18,41 @@ from fastapi import FastAPI
 
 from agents.common import (
     LOG_MCP_URL,
+    AgentError,
     EvidenceLine,
     InvestigationRequest,
     InvestigationResult,
     MCPToolError,
     call_mcp,
+    invoke_governed,
     log_event,
     make_logger,
 )
 
 app = FastAPI(title="log-agent", version="0.4.0")
 logger = make_logger("log-agent")
+
+
+async def _search_logs(req: InvestigationRequest) -> dict:
+    """Governed path (Agent -> ArmorIQ invoke -> log-mcp) when the Commander
+    handed this agent a delegated authority; otherwise the unguarded direct
+    MCP path (Phase 4 baseline, preserved for regression)."""
+    if req.authority is not None:
+        log_event(logger, req.incident_id, "investigation_governed", "running",
+                  delegation_id=req.authority.delegation_id)
+        return invoke_governed(
+            agent="log_agent",
+            authority=req.authority,
+            mcp="log-mcp",
+            action="search_logs",
+            params={"service": req.service, "limit": req.limit, "keyword": req.keyword},
+            incident_id=req.incident_id,
+        )
+    return await call_mcp(
+        LOG_MCP_URL,
+        "search_logs",
+        {"service": req.service, "limit": req.limit, "keyword": req.keyword},
+    )
 
 
 @app.get("/health")
@@ -41,11 +65,7 @@ async def run_task(req: InvestigationRequest) -> InvestigationResult:
     log_event(logger, req.incident_id, "investigation_started", "running",
               service=req.service, limit=req.limit)
     try:
-        payload = await call_mcp(
-            LOG_MCP_URL,
-            "search_logs",
-            {"service": req.service, "limit": req.limit, "keyword": req.keyword},
-        )
+        payload = await _search_logs(req)
         lines = payload.get("lines", [])
         evidence = [EvidenceLine(index=i, text=line) for i, line in enumerate(lines)]
         summary = f"Collected {len(evidence)} log line(s) for service '{req.service}'."
@@ -57,7 +77,7 @@ async def run_task(req: InvestigationRequest) -> InvestigationResult:
             summary=summary,
             status="ok",
         )
-    except MCPToolError as exc:
+    except (MCPToolError, AgentError) as exc:
         log_event(logger, req.incident_id, "investigation_failed", "error", error=str(exc))
         return InvestigationResult(
             incident_id=req.incident_id,

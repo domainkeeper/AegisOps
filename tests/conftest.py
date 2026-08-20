@@ -31,11 +31,38 @@ os.environ["AEGISOPS_LLM_FALLBACK"] = "test"
 # records intent_token_status="not_configured" unless a test injects a key.
 os.environ["ARMORIQ_API_KEY"] = ""
 
+# Audit mirror writes go to a throwaway location during tests, never the repo.
+os.environ["AEGISOPS_AUDIT_DB"] = str(REPO_ROOT / ".pytest_cache" / "audit-test.db")
+
 PROCESSES: list[subprocess.Popen] = []
 
 AUTH_API_HEALTH_URL = "http://localhost:8080/health"
 AUTH_API_BREAK_URL = "http://localhost:8080/break"
 AUTH_API_FIX_URL = "http://localhost:8080/fix"
+
+# Agent/MCP ports owned by the suite. Anything already listening on them when
+# the session starts is stale (e.g. left behind by scripts/run_incident.sh) and
+# would silently poison results - terminate it so the suite always tests the
+# code under test, not a leftover process with different env/behavior.
+SUITE_PORTS = (8081, 8082, 8083, 8091, 8092, 8093, 8094)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reclaim_suite_ports():
+    import subprocess as _sp
+
+    for port in SUITE_PORTS:
+        _sp.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                f"$c = Get-NetTCPConnection -LocalPort {port} -State Listen "
+                "-ErrorAction SilentlyContinue; if ($c) {{ Stop-Process -Id "
+                "$c[0].OwningProcess -Force }}",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    yield
 
 
 def wait_for_port(port: int, timeout_s: float = 40.0) -> None:

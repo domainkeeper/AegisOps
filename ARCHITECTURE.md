@@ -102,13 +102,16 @@ flowchart TB
 
 ## 4. Agent Architecture
 
-> **Phase 5 status (2026-08-20):** all four agents run as genuinely separate processes WITHOUT ArmorIQ
-> enforcement — the **unguarded baseline**. §4.1–§4.4 below document the ArmorIQ-enabled design (future
-> phases 6–9); §4.5–§4.9 document the unguarded multi-agent system that is actually running now; §4.10
-> documents what Phase 5 added (per-agent identities + explicit plan + intent token). The two must not be
-> confused: today the agents call the MCPs directly over localhost HTTP, and the Diagnosis Agent's restart
-> attempt succeeds. Phase 5 added ArmorIQ *intent* (a captured 4-step plan and an intent token held in
-> memory) but no *enforcement* — `delegate()` and `invoke()` arrive in Phase 6+.
+> **Phase 6+7 status (2026-08-20):** all four agents run as genuinely separate processes. §4.1–§4.4 below
+> document the ArmorIQ-enabled design (enforcement demonstrations still pending — Phases 8–9); §4.5–§4.9
+> document the unguarded multi-agent system; §4.10 documents Phase 5 (per-agent identities + explicit plan
+> + intent token); §4.11 documents what Phases 6–7 added (delegation + governed invocation + audit mirror).
+> The two execution paths must not be confused: with a delegation present on a request, the child agent
+> invokes its MCP actions **through ArmorIQ** (`invoke()` → proxy); without one (no `ARMORIQ_API_KEY`), the
+> agents call the MCPs directly over localhost HTTP and the Diagnosis Agent's restart attempt succeeds —
+> the unguarded baseline is preserved and reported honestly (`delegations: []`, `governed: false`). Phase 5
+> added ArmorIQ *intent*; Phases 6–7 added *authority + governed invocation*; *enforcement demonstrations*
+> (blocked/denied) are Phase 8+.
 
 All four agents are **separate Python processes** (`agents/*.py`), started independently. Each owns an
 Ed25519 keypair under `.keys/<role>/` and an email scope (`AEGISOPS_<ROLE>_EMAIL`, default
@@ -314,6 +317,63 @@ Incident received
    │        ready | error | not_configured  (token held in memory only, never logged)
    │
    └─ then the unguarded Phase 4 flow runs exactly as before (Agent → MCP → Docker)
+```
+
+### 4.11 Phase 6+7 implemented design — delegation, governed invocation, audit mirror
+
+Phases 6–7 add the authority layer without changing the unguarded baseline (which stays reachable and is
+the regression proof):
+
+- **Delegation (`armoriq/delegation.py`)** — the central authority matrix is enforced in code + tests:
+  `log_agent → ["search_logs"]`, `diagnosis_agent → ["get_service_status", "inspect_service_state"]`,
+  `remediation_agent → ["restart_service"]`. `create_delegations(client, root_token)` validates each scope
+  against `_VERIFIED_SCOPES` **before any network call** (`ScopeValidationError`), binds each delegation to
+  the child's own Ed25519 public key (`ensure_keypair`), and calls the verified SDK method
+  `delegate(intent_token, delegate_public_key, validity_seconds, allowed_actions, target_agent)`.
+  Delegated-token validity: `AEGISOPS_DELEGATION_VALIDITY` (default 300s). DelegationResult → in-memory
+  `DelegationRecord` (agent, delegation_id, allowed_actions, expires_at, status, target_agent, token).
+- **Commander (`_delegate_intents`)** — after a successful intent handshake the root token (memory only,
+  `IncidentContext._root_token`) is used to delegate to all three children. Best-effort: a failure records
+  `delegation_error` + an audit row and the incident continues unguarded — never faked, never aborting.
+  `IncidentResult` carries only safe metadata: `delegations`, `delegation_error`, `governed`.
+- **Child authority transport** — each dispatch carries a `DelegatedAuthority` payload (agent,
+  delegation_id, allowed_actions, expires_at, target_agent, serialized token) over the local agent HTTP
+  channel to the owning child only. Never logged, never serialized in responses.
+- **Governed invocation (`invoke_governed` in `agents/common.py`)** — the single governed call path:
+  `IntentToken.model_validate(authority.token)` → `client.invoke(mcp, action, token, params,
+  user_email=<child email>)` → parse the verified `MCPInvocationResult`. Mode selection is by authority
+  presence, not an env flag: request carries a delegation → governed; otherwise direct MCP (Phase 4).
+- **Rejection handling** — ArmorIQ exceptions are surfaced, never swallowed: the verified `ArmorIQException`
+  base is caught, `type(exc).__name__` is recorded (no hardcoded block class), an audit row is written
+  (`status="blocked"` for `PolicyBlockedException`, `"error"` otherwise), and an `AgentError` surfaces into
+  the incident result. The SDK's local fail-closed checks (`TokenExpiredException`, `IntentMismatchException`,
+  missing proofs) behave identically.
+- **Per-agent governed behavior** — Log Agent: `log-mcp.search_logs` via ArmorIQ. Diagnosis Agent:
+  `diagnostic-mcp.get_service_status` + `inspect_service_state` via ArmorIQ; it holds no restart authority,
+  so in governed mode it defers the restart to the Remediation Agent (the deliberate blocked attempt is the
+  Phase 8 demonstration). Remediation Agent: `remediation-mcp.restart_service` via ArmorIQ; its idempotency
+  health probe stays a direct read-only MCP call.
+- **Audit mirror (`database/audit.py`)** — SQLite `audit_events` table (incident_id, agent, parent_agent,
+  action, status, delegation_id, error_type, detail, created_at); env `AEGISOPS_AUDIT_DB` (default
+  `database/audit.db`, gitignored). Safe metadata only: tokens/keys/signatures are refused
+  (`_FORBIDDEN_FIELDS`, asserted by tests). Writes are best-effort and never break the incident flow.
+  ArmorIQ remains the source of truth; this is a thin local mirror for the demo trail.
+- **Not yet implemented (Phases 8–9):** the blocked/denied demonstrations, token-expiry demonstration,
+  post-diagnosis re-delegation, proxy flow against registered MCPs.
+
+```text
+Incident received
+   │
+   ├─ 1–4. plan + intent token (as §4.10)                       [always]
+   ├─ 5. delegate() ×3 from root token                          [needs ARMORIQ_API_KEY]
+   │        success → governed=True, 3 in-memory DelegationRecords (audited)
+   │        failure → governed=False, delegation_error + audit row (incident continues UNGUARDED)
+   │        no key  → no root token → governed=False (honest: delegations=[], governed=false)
+   │
+   └─ orchestration: each child gets authority payload (or none)
+        ├─ authority present → Agent → invoke() → ArmorIQ Proxy → MCP → real resource
+        │      rejection → audit row (blocked/error) + AgentError surfaced in IncidentResult
+        └─ no authority    → Agent → MCP → real resource (Phase 4 unguarded baseline)
 ```
 
 ---
@@ -587,9 +647,12 @@ the SDK. Facts below were verified on 2026-08-19 against `docs.armoriq.ai` (curr
 
 ### 8.6 Delegation & authorization design (unchanged)
 
-> **Phase 5 status (2026-08-20):** the design below is the target. Phase 5 implemented the foundation up to
-> and including the root **intent token** (`capture_plan` → `get_intent_token`, see §4.10). `delegate()` and
-> `invoke()` are NOT yet wired in — that is Phase 6+.
+> **Phase 6+7 status (2026-08-20):** the design below is the target. Phase 5 implemented the foundation up to
+> and including the root **intent token** (`capture_plan` → `get_intent_token`, see §4.10). Phases 6–7 wired
+> in `delegate()` (scoped, key-bound, in-memory) and `invoke()` (governed path, rejections surfaced +
+> mirrored to the SQLite audit table) — see §4.11. The proxy/registered-MCP enforcement flow and the
+> blocked/denied demonstrations remain Phase 8+ (the runtime exception mapping is unverified without a live
+> key).
 
 The intended flow (unchanged from the original design):
 
@@ -814,7 +877,8 @@ AegisOps/
 ├── armoriq/
 │   ├── __init__.py            # package exports
 │   ├── client_setup.py        # env loading, ARMORIQ_API_KEY validation, client factory, per-agent Ed25519 keypair lifecycle + email scopes (Phase 5)
-│   └── plan.py                # explicit 4-step plan: build/validate -> capture_plan -> get_intent_token (Phase 5)
+│   ├── plan.py                # explicit 4-step plan: build/validate -> capture_plan -> get_intent_token (Phase 5)
+│   └── delegation.py          # Phase 6: verified scopes, create_delegations (delegate ×3), in-memory DelegationRecord, safe metadata
 ├── infrastructure/
 │   ├── auth_api/
 │   │   ├── main.py           # FastAPI app: /health, /break, /fix (in-memory state)
@@ -822,17 +886,19 @@ AegisOps/
 │   │   ├── Dockerfile        # python:3.12-slim, port 8080, HEALTHCHECK
 │   │   └── .dockerignore
 ├── database/
-│   ├── schema.sql            # incidents + audit_events DDL (Phase 7)
-│   └── db.py                 # Thin sqlite3 wrapper (Phase 7)
+│   ├── __init__.py            # Phase 7: exports AuditStore, get_store, audit
+│   ├── audit.py               # Phase 7: SQLite audit mirror (safe metadata only; AEGISOPS_AUDIT_DB)
+│   └── audit.db               # (gitignored) local audit mirror
 ├── tests/
-│   ├── conftest.py            # shared fixtures/helpers: env, MCP+agent spawning, hermetic LLM fallback
+│   ├── conftest.py            # shared fixtures/helpers: env, MCP+agent spawning, hermetic LLM fallback, suite-port reclaim
 │   ├── test_infrastructure.py # Phase 2: health/break/real-restart lifecycle (5 tests)
 │   ├── test_mcp_spike.py      # Phase 3: transport wire format + spike round-trip (4 tests)
 │   ├── test_mcp_tools.py      # Phase 3: all three MCPs, incl. real restart integration (13 tests)
 │   ├── test_agents_unit.py    # Phase 4: contracts, LLM validation, fallback, lifecycle, no-shell (31 tests)
 │   ├── test_agents_integration.py # Phase 4: real processes + real MCPs + real Docker (7 tests)
 │   ├── test_phase5.py         # Phase 5: identities, plan validation, intent-token states, token never serialized (14 tests)
-│   ├── test_e2e.py            # Phase 4/5: full incident -> real restart -> RESOLVED + plan/intent assertions (1 test)
+│   ├── test_phase67.py        # Phase 6+7: delegation scopes/keys/metadata, governed invoke, audit mirror, no secrets (17 tests)
+│   ├── test_e2e.py            # Phase 4/5: full incident -> real restart -> RESOLVED + plan/intent/delegation assertions (1 test)
 │   ├── test_authorization.py  # Phase 8: Security path (blocked) + happy path (allowed) — critical
 │   └── test_e2e_authorized.py # Phase 9/10: full flow with ArmorIQ enforcement
 ├── scripts/
@@ -940,8 +1006,8 @@ Dependency-aware order from PLAN §13. Each phase is gated on the previous one:
 | 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` speaking **JSON-RPC 2.0 + SSE** (`initialize`/`tools/list`/`tools/call`), registered on the platform under exact names; resolve local-MCP connectivity first (§8.3) — **DONE (2026-08-19)**: official MCP SDK v2 (mcp==2.0.0), Streamable HTTP; connectivity resolved (§7.2: local = direct localhost, ArmorIQ = tunnel or self-hosted proxy); spike verified; 3 servers + 4 tools; 17/17 MCP tests pass incl. real restart | Agents need tools; tools need infra (Phase 2) and registration |
 | 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) — **DONE (2026-08-20)**: `agents/` (commander :8094, log-agent :8091, diagnosis-agent :8092, remediation-agent :8093), pydantic contracts, Gemini LLM + validated schema + marked test fallback, real restart via the diagnosis agent's unguarded attempt, idempotent remediation agent; 39 agent tests pass (31 unit + 7 integration + 1 E2E) plus `scripts/run_incident.sh` runs one incident end to end (§4.5–§4.9) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
 | 5 | **ArmorIQ identities + plan** — per-agent keypairs + email scopes; explicit 4-step plan; `capture_plan()` → `get_intent_token()` — **DONE (2026-08-20)**: `.keys/<role>/` per-agent Ed25519 keypairs, `AEGISOPS_<ROLE>_EMAIL` scopes, `armoriq/plan.py` (build/validate/capture/token), Commander `_capture_intent` on `/incident` with honest `ready`/`error`/`not_configured` states and the token never stored/logged/serialized; `scripts/ensure_identities.py` + `scripts/armoriq_plan_token.py`; `tests/test_phase5.py`; full suite 93 tests pass | The authorization layer's foundation |
-| 6 | **ArmorIQ delegation** — `delegate()` ×3 with correct `allowed_actions` | Tokens are the currency of Phase 7 |
-| 7 | **Wire `invoke()` into every MCP call** — replace direct HTTP calls | The scenario now runs through ArmorIQ |
+| 6 | **ArmorIQ delegation** — `delegate()` ×3 with correct `allowed_actions` — **DONE (2026-08-20)**: `armoriq/delegation.py` verified scopes (log `["search_logs"]`, diagnosis `["get_service_status","inspect_service_state"]` — restart excluded, remediation `["restart_service"]`), scope validated before any network call (`ScopeValidationError`), key-bound to each child's Ed25519 public key, `AEGISOPS_DELEGATION_VALIDITY` (default 300s), tokens in memory only, safe metadata on `IncidentResult` (`delegations`, `delegation_error`, `governed`); delegation failure keeps the incident unguarded and is reported honestly | Tokens are the currency of Phase 7 |
+| 7 | **Wire `invoke()` into the governed MCP calls** — **DONE (2026-08-20)**: `invoke_governed` (`agents/common.py`) used when a request carries a delegation (mode selected by authority presence, no env flag); Agent → ArmorIQ Proxy → MCP for log/diagnosis/remediation; rejections surfaced as `AgentError` with the verified `ArmorIQException` type + audit row (blocked/error); unguarded direct-MCP path preserved; SQLite audit mirror (`database/audit.py`, safe metadata only, `AEGISOPS_AUDIT_DB`); `tests/test_phase67.py`; full suite 110 tests pass | The scenario now runs through ArmorIQ when connected |
 | 8 | **The violation + enforcement** — Diagnosis Agent's blocked `restart_service`; audit row | The demo's centerpiece; depends on 5-7 |
 | 9 | **Authorized remediation** — post-diagnosis delegation → allowed restart → health recovery | Completes the block/allow story |
 | 10 | **Testing + audit trail + demo polish** — the 2 critical tests, trail viewer or terminal output, reset script, rehearsal | Only meaningful once 2-9 work; end with repeatability |

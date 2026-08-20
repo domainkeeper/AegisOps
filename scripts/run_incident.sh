@@ -7,6 +7,10 @@
 # marks the incident RESOLVED. The Commander also builds and captures the
 # explicit 4-step plan (Phase 5 intent handshake; needs ARMORIQ_API_KEY for a
 # real intent token, otherwise reported as not_configured - never faked).
+# With a working ARMORIQ_API_KEY, Phase 6/7 activate: the Commander delegates
+# three scoped authorities (log/diagnosis/remediation) and the children invoke
+# their MCP actions through ArmorIQ (governed path); otherwise the run stays
+# unguarded (Phase 4 baseline) and that is reported honestly as 0 delegations.
 #
 # Usage:
 #   scripts/run_incident.sh [incident_id]
@@ -56,7 +60,7 @@ response=$(curl -fsS -X POST http://127.0.0.1:8094/incident \
   -d "{\"incident_id\":\"$INCIDENT_ID\",\"service\":\"auth-api\",\"severity\":\"high\",\"description\":\"auth-api unhealthy\"}")
 
 echo "[5/6] Incident result:"
-echo "$response" | "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print('  status        :', d['status']); print('  incident_id   :', d['incident_id']); print('  evidence items:', len((d.get('investigation') or {}).get('evidence', []))); diag=d.get('diagnosis') or {}; print('  diagnosis     :', diag.get('diagnosis','')); print('  llm_source    :', diag.get('llm_source')); rem=d.get('remediation') or {}; print('  remediation   :', (('noop=' + str(rem.get('noop')) + ' success=' + str(rem.get('success'))) if rem.get('noop') is not None else 'none needed'), (rem.get('started_at') or '')); print('  verification  :', (d.get('verification') or {}).get('status')); plan=d.get('plan') or {}; print('  plan          :', str(len(plan.get('steps', []))) + ' steps captured (' + ', '.join(s.get('action','') for s in plan.get('steps', [])) + ')'); ts=d.get('intent_token_status'); print('  intent token  :', ts, (d.get('intent_token_expires_at') or ('(' + (d.get('intent_token_error') or '') + ')' if ts != 'ready' else ''))); print('  error         :', d.get('error'))" 2>/dev/null \
+echo "$response" | "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print('  status        :', d['status']); print('  incident_id   :', d['incident_id']); print('  evidence items:', len((d.get('investigation') or {}).get('evidence', []))); diag=d.get('diagnosis') or {}; print('  diagnosis     :', diag.get('diagnosis','')); print('  llm_source    :', diag.get('llm_source')); rem=d.get('remediation') or {}; print('  remediation   :', (('noop=' + str(rem.get('noop')) + ' success=' + str(rem.get('success'))) if rem.get('noop') is not None else 'none needed'), (rem.get('started_at') or '')); print('  verification  :', (d.get('verification') or {}).get('status')); plan=d.get('plan') or {}; print('  plan          :', str(len(plan.get('steps', []))) + ' steps captured (' + ', '.join(s.get('action','') for s in plan.get('steps', [])) + ')'); ts=d.get('intent_token_status'); print('  intent token  :', ts, (d.get('intent_token_expires_at') or ('(' + (d.get('intent_token_error') or '') + ')' if ts != 'ready' else ''))); deps=d.get('delegations') or []; print('  delegations   :', (str(len(deps)) + ' (governed=True, ' + ', '.join(x.get('agent','') + ':' + ','.join(x.get('allowed_actions', [])) for x in deps) + ')') if deps else ('0 (governed=False)' + ((' - ' + d.get('delegation_error')) if d.get('delegation_error') else ''))); print('  error         :', d.get('error'))" 2>/dev/null \
   || echo "$response" | sed 's/^/  /'
 
 case "$response" in

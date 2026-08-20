@@ -69,6 +69,12 @@ class IncidentContext:
         self.intent_token_status: str = "not_configured"
         self.intent_token_expires_at: str | None = None
         self.intent_token_error: str | None = None
+        # Phase 6: delegations + governed path state. Tokens live ONLY on these
+        # in-memory records; nothing here is ever serialized into the result.
+        self._root_token: object | None = None
+        self.delegations: dict = {}
+        self.delegation_error: str | None = None
+        self.governed: bool = False
         self.error: str | None = None
 
     def stage(self, name: str, status: str, detail: str = "") -> None:
@@ -76,6 +82,8 @@ class IncidentContext:
 
 
 def _to_error_result(ctx: IncidentContext) -> IncidentResult:
+    from armoriq.delegation import delegations_metadata
+
     return IncidentResult(
         incident_id=ctx.incident.incident_id,
         status=ctx.status,
@@ -88,6 +96,8 @@ def _to_error_result(ctx: IncidentContext) -> IncidentResult:
         intent_token_status=ctx.intent_token_status,
         intent_token_expires_at=ctx.intent_token_expires_at,
         intent_token_error=ctx.intent_token_error,
+        delegations=delegations_metadata(ctx.delegations),
+        governed=ctx.governed,
         timeline=ctx.timeline,
         error=ctx.error,
     )
@@ -138,13 +148,71 @@ def _capture_intent(ctx: IncidentContext) -> None:
                   error=ctx.intent_token_error)
         return
 
-    # Keep only non-sensitive state. The token is never stored on the context.
+    # Keep only non-sensitive state. The token is never logged or serialized,
+    # but the root token is kept in memory on the context so we can delegate
+    # from it (Phase 6). Only its status/expiry are ever surfaced.
     ctx.intent_token_status = "ready"
-    ctx.intent_token_expires_at = getattr(token, "expires_at", None) or ""
+    expires_at = getattr(token, "expires_at", None)
+    if isinstance(expires_at, (int, float)):
+        ctx.intent_token_expires_at = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(expires_at))
+        )
+    else:
+        ctx.intent_token_expires_at = str(expires_at or "")
+    ctx._root_token = token
     ctx.stage("intent_capture", "ready",
               detail=f"intent token ready, expires_at={ctx.intent_token_expires_at}")
     log_event(logger, ctx.incident.incident_id, "intent_capture", "ready",
               expires_at=ctx.intent_token_expires_at)
+
+    _delegate_intents(ctx, client, token)
+
+
+def _delegate_intents(ctx: IncidentContext, client: object, root_token: object) -> None:
+    """Phase 6 delegation: create the three child authorities from the root token.
+
+    Best-effort: on failure the incident continues UNGUARDED (Phase 4 safety
+    net preserved); the failure is recorded in delegations metadata + audit
+    mirror and surfaced honestly. Nothing is faked and tokens are never logged.
+    """
+    from armoriq.delegation import ScopeValidationError, create_delegations
+    from database.audit import audit
+
+    incident_id = ctx.incident.incident_id
+    try:
+        records = create_delegations(client, root_token)
+    except Exception as exc:  # noqa: BLE001 - delegation is best-effort, never aborts the incident
+        ctx.delegation_error = f"delegation failed: {type(exc).__name__}: {exc}"
+        ctx.governed = False
+        ctx.stage("delegated", "error", detail=ctx.delegation_error)
+        audit(
+            incident_id=incident_id,
+            agent="commander",
+            parent_agent=None,
+            action="delegate",
+            status="error",
+            error_type=type(exc).__name__,
+            detail=str(exc)[:400],
+        )
+        log_event(logger, incident_id, "delegation", "error", error=ctx.delegation_error)
+        return
+
+    ctx.delegations = records
+    ctx.governed = True
+    for record in records.values():
+        audit(
+            incident_id=incident_id,
+            agent=record.agent,
+            parent_agent="commander",
+            action="delegate",
+            status="success",
+            delegation_id=record.delegation_id,
+            detail=f"allowed_actions={record.allowed_actions}, expires_at={record.expires_at}",
+        )
+    ctx.stage("delegated", "ok",
+              detail=",".join(f"{a}:{r.delegation_id[:8]}" for a, r in records.items()))
+    log_event(logger, incident_id, "delegation", "ok",
+              agents=[a for a in records], governed=True)
 
 
 def _validate_result(model, payload: dict, label: str) -> None:
@@ -153,6 +221,20 @@ def _validate_result(model, payload: dict, label: str) -> None:
         model.model_validate(payload)
     except Exception as exc:
         raise AgentError(f"invalid response from {label}: {exc}") from exc
+
+
+def _authority_for(ctx: IncidentContext, agent: str) -> "DelegatedAuthority | None":
+    """The child's delegated authority payload, or None when not governed.
+
+    The serialized token goes only to the owning child over the local agent
+    channel; it is never logged or returned in responses.
+    """
+    from agents.common import DelegatedAuthority
+
+    record = ctx.delegations.get(agent)
+    if record is None:
+        return None
+    return DelegatedAuthority.model_validate(record.authority_payload())
 
 
 @app.get("/health")
@@ -177,8 +259,11 @@ async def handle_incident(incident: Incident) -> IncidentResult:
         ctx.stage("investigating", "running")
         resp = await post_json(
             LOG_AGENT_URL + "/run_task",
-            InvestigationRequest(incident_id=incident.incident_id, service=incident.service)
-            .model_dump(),
+            InvestigationRequest(
+                incident_id=incident.incident_id,
+                service=incident.service,
+                authority=_authority_for(ctx, "log_agent"),
+            ).model_dump(),
         )
         _validate_result(InvestigationResult, resp, "log-agent")
         ctx.investigation = InvestigationResult.model_validate(resp)
@@ -197,6 +282,7 @@ async def handle_incident(incident: Incident) -> IncidentResult:
                 incident_id=incident.incident_id,
                 service=incident.service,
                 evidence=ctx.investigation.evidence,
+                authority=_authority_for(ctx, "diagnosis_agent"),
             ).model_dump(),
         )
         _validate_result(DiagnosisResult, resp, "diagnosis-agent")
@@ -215,8 +301,11 @@ async def handle_incident(incident: Incident) -> IncidentResult:
             ctx.stage("remediating", "running")
             resp = await post_json(
                 REMEDIATION_AGENT_URL + "/run_task",
-                RemediationRequest(incident_id=incident.incident_id, service=incident.service)
-                .model_dump(),
+                RemediationRequest(
+                    incident_id=incident.incident_id,
+                    service=incident.service,
+                    authority=_authority_for(ctx, "remediation_agent"),
+                ).model_dump(),
             )
             _validate_result(RemediationResult, resp, "remediation-agent")
             ctx.remediation = RemediationResult.model_validate(resp)

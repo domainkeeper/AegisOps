@@ -79,17 +79,19 @@ model-generated).
 
 ## ArmorIQ's Role
 
-ArmorIQ is the source of truth for authorization. Phase 5 implements the intent layer; Phase 6+ adds the
-enforcement layer:
+ArmorIQ is the source of truth for authorization. Phase 5 implemented the intent layer; Phases 6–7 added the
+authority + governed-invocation layer (enforcement demonstrations are Phase 8):
 
 - `capture_plan()` — **implemented (Phase 5):** Commander captures the explicit 4-step incident plan
   (goal + steps) — local
 - `get_intent_token()` — **implemented (Phase 5):** plan is canonicalized, hashed, Merkle-proved, and signed;
   the token is held in memory as readiness state, never logged or returned
-- `delegate()` — **Planned (Phase 6):** Commander mints scoped, time-limited tokens bound to each child
-  agent's public key
-- `invoke()` — **Planned (Phase 7):** every tool call is verified at the ArmorIQ Proxy; out-of-scope calls
-  are **blocked**
+- `delegate()` — **implemented (Phase 6):** Commander mints three scoped, time-limited tokens, each bound to
+  a child agent's public key (log: `search_logs`; diagnosis: read-only state tools; remediation:
+  `restart_service`)
+- `invoke()` — **implemented (Phase 7):** every governed tool call goes through the ArmorIQ Proxy with the
+  delegated token; out-of-scope calls are **blocked** by ArmorIQ and the verified exception type is
+  surfaced + audited
 
 ## Core Security Concept
 
@@ -100,20 +102,26 @@ The first is **blocked** by ArmorIQ. The second **succeeds**. The only differenc
 cryptographically-signed token was presented — enforcement is keyed on the token's allow-list and signed
 plan proof, never on the text of the request and never on what an LLM intends.
 
-## Incident Scenario (current, unguarded)
+## Incident Scenario (current)
 
 1. `auth-api` container is broken (`POST /break`) — `/health` → 503
 2. The incident is submitted to the Commander (`POST /incident`) — it builds the explicit 4-step plan and
-   captures it with ArmorIQ (`capture_plan` → `get_intent_token`; honest `not_configured` without a key)
-3. Commander asks the Log Agent to investigate → log evidence
+   captures it with ArmorIQ (`capture_plan` → `get_intent_token`; honest `not_configured` without a key),
+   then delegates three scoped authorities to the children (`delegate()` ×3; honest `delegations: []` +
+   `governed: false` without a key)
+3. Commander asks the Log Agent to investigate → log evidence (governed `invoke()` when a delegation is
+   held, otherwise the unguarded direct path)
 4. Commander sends the evidence to the Diagnosis Agent → service state + LLM/fallback reasoning
-5. Diagnosis concludes a restart is needed — and (unguarded baseline) **attempts `restart_service("auth-api")` itself** → succeeds
-6. Commander asks the Remediation Agent to confirm → service already healthy, idempotent no-op
+5. Diagnosis concludes a restart is needed. **Governed mode:** it holds no restart authority, so it defers
+   the restart to the Remediation Agent (the deliberate blocked attempt is Phase 8). **Unguarded mode**
+   (no ArmorIQ credentials): it performs the restart itself (Phase 4 baseline)
+6. Commander asks the Remediation Agent to restart (`restart_service` — governed `invoke()` or direct)
 7. Commander verifies `/health` and marks the incident **RESOLVED**
 
-This exact unguarded baseline is the proof that the workflow works before authorization is inserted. In the
-ArmorIQ phases the Diagnosis Agent's restart attempt will be **blocked** (its delegated token has no
-`restart_service` authority) and only the Remediation Agent's separately-delegated call will succeed.
+With ArmorIQ credentials the flow is Agent → ArmorIQ Proxy → MCP; without them the identical unguarded
+baseline runs and that fact is reported honestly. The Phase 8 enforcement demonstration turns the Diagnosis
+Agent's restart attempt into the **blocked** case (its delegated token has no `restart_service` authority)
+while the Remediation Agent's separately-delegated call **succeeds**.
 
 ## Planned Stack
 
@@ -147,7 +155,13 @@ ArmorIQ phases the Diagnosis Agent's restart attempt will be **blocked** (its de
   `get_intent_token()` on every incident with the token never stored/logged/serialized; standalone
   `scripts/ensure_identities.py` and `scripts/armoriq_plan_token.py`; `tests/test_phase5.py`. The LLM
   switched to the verified `gemini-3.5-flash-lite` via `google-genai`.
-- **ArmorIQ enforcement not implemented yet** — `delegate()` + `invoke()` + the blocked path are Phase 6+.
+- **Delegation + governed invocation + audit mirror built (Phases 6–7)** — `armoriq/delegation.py` mints
+  the three scoped authorities (`delegate()` ×3, verified scopes, key-bound, tokens in memory only);
+  governed agents call `invoke()` through the ArmorIQ proxy when they hold a delegation (`invoke_governed`,
+  rejections surfaced + audited, never faked); SQLite audit mirror (`database/audit.py`, safe metadata
+  only); no credentials → unguarded Phase 4 baseline unchanged and reported honestly. `tests/test_phase67.py`.
+- **Enforcement demonstrations not implemented yet** — the blocked (Phase 8) and allowed (Phase 9)
+  demonstrations need a real ArmorIQ account + registered MCPs.
 
 ## Current Status
 
@@ -164,8 +178,10 @@ ArmorIQ phases the Diagnosis Agent's restart attempt will be **blocked** (its de
 | Multi-agent orchestration (unguarded) | **Implemented** (4 processes, HTTP contracts, Gemini diagnosis, real restart; 39 tests incl. full E2E) |
 | Agent identities (Phase 5) | **Implemented** (`.keys/<role>/` Ed25519 keypairs + `AEGISOPS_<ROLE>_EMAIL` scopes) |
 | Explicit plan + intent token (Phase 5) | **Implemented** (`armoriq/plan.py`; `capture_plan` → `get_intent_token`; honest ready/error/not_configured) |
-| ArmorIQ delegate/invoke wiring | **Planned** (Phase 6–7) |
-| Database | **Planned** |
+| Delegation (Phase 6) | **Implemented** (`armoriq/delegation.py`; scoped `delegate()` ×3, key-bound, in-memory tokens, honest delegations/governed) |
+| Governed invocation (Phase 7) | **Implemented** (`invoke_governed`; authority-presence mode selection; rejections surfaced + audited, no fake rules) |
+| Database | **Implemented** (SQLite audit mirror `database/audit.py`; safe metadata only) |
+| Enforcement demonstrations (Phase 8–9) | **Planned** (needs a real ArmorIQ account + registered MCPs) |
 | Demo scripts | **Implemented** (`run_incident.sh` runs one complete incident end to end) |
 
 ## Setup
@@ -223,8 +239,9 @@ python -m pytest tests/test_mcp_tools.py -v           # 13 tests - MCPs incl. re
 python -m pytest tests/test_agents_unit.py -v         # 31 tests - contracts, LLM validation, fallback
 python -m pytest tests/test_agents_integration.py -v  # 7 tests - real agent processes + MCPs + Docker
 python -m pytest tests/test_phase5.py -v              # 14 tests - identities, plan, intent token
+python -m pytest tests/test_phase67.py -v             # 17 tests - delegation, governed invoke, audit mirror
 python -m pytest tests/test_e2e.py -v                 # 1 test - full incident, real restart, RESOLVED
-python -m pytest tests/                               # everything (93 tests)
+python -m pytest tests/                               # everything (110 tests)
 ```
 
 ## Demo
@@ -235,10 +252,11 @@ scripts/run_incident.sh
 
 One command, zero manual steps: it ensures infrastructure + MCPs + agents are up, breaks `auth-api`, waits
 until `/health` reports unhealthy, submits the incident, and prints the final result (RESOLVED) with the
-evidence count, diagnosis text, LLM source, the captured 4-step plan, the intent-token status, and the
-verification. The auth-api Docker container genuinely restarts in the middle of the flow. No LLM key is
-required — with `AEGISOPS_GEMINI_API_KEY` unset it prints a notice and uses the explicitly-marked
-deterministic test fallback for the diagnosis.
+evidence count, diagnosis text, LLM source, the captured 4-step plan, the intent-token status, the
+delegations (governed or unguarded), and the verification. The auth-api Docker container genuinely restarts
+in the middle of the flow. No LLM key is required — with `AEGISOPS_GEMINI_API_KEY` unset it prints a notice
+and uses the explicitly-marked deterministic test fallback for the diagnosis. No ArmorIQ key is required
+either — without one it honestly reports 0 delegations and runs the unguarded baseline.
 
 ---
 

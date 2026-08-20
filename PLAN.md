@@ -96,6 +96,15 @@ VERIFY AGAINST CURRENT ARMORIQ SDK DOCS before coding — in particular confirm 
 
 That is the entire product. Resist adding anything else.
 
+> **Phase 6/7 implementation note (2026-08-20):** the scenario above is the target (and the Phase 8–9
+> demonstrations will reproduce steps 6–9 exactly). What is implemented today is a strict least-privilege
+> variant of step 3: the Commander delegates **three** tokens up front — Log `["search_logs"]`,
+> Diagnosis `["get_service_status","inspect_service_state"]`, Remediation `["restart_service"]` — so
+> `search_logs` lives only on the Log Agent's token (not the Diagnosis Agent's). Remediation authority is
+> minted at incident start rather than post-diagnosis; the "Commander decides to escalate" beat can be added
+> in Phase 9. The non-negotiable boundary is unchanged: **the Diagnosis token must never contain
+> `restart_service`**.
+
 ---
 
 ## 2. Why this proves real authorization, not a keyword filter
@@ -360,14 +369,16 @@ Skip if behind: none — this is core to the system.
 Status: **DONE (2026-08-20)** — per-agent Ed25519 keypairs under `.keys/<role>/` + per-agent email scopes (`AEGISOPS_<ROLE>_EMAIL`, default `<role>@aegisops.local`) via `armoriq/client_setup.py` (`ensure_keypair`/`agent_email`; gitignored, never logged); explicit 4-step plan + strict validation + `capture_plan` → `get_intent_token` in new `armoriq/plan.py`; Commander runs the handshake best-effort on every `/incident` (`_capture_intent`) and records `plan` / `intent_token_status` (`ready`/`error`/`not_configured`) / `intent_token_expires_at` / `intent_token_error` on `IncidentResult` — the token itself is never stored, serialized, or logged; missing key → honest `not_configured`, never blocks the unguarded flow; `scripts/{ensure_identities.sh,armoriq_plan_token.py}`; `tests/test_phase5.py` (14 tests); full suite 93 tests pass. Deliberately NOT done here: `delegate()`, `invoke()`, enforcement (Phase 6+).
 
 ### Phase 6 — ArmorIQ: delegation (60 min)
-Tasks: Commander calls `delegate()` for Log Agent, Diagnosis Agent (restricted `allowed_actions`), and (later, after diagnosis) Remediation Agent; delegated tokens passed to sub-agents over HTTP.
+Tasks: Commander calls `delegate()` for Log Agent, Diagnosis Agent (restricted `allowed_actions`), and Remediation Agent; delegated tokens passed to sub-agents over HTTP.
 Done when: each sub-agent holds a distinct delegated token with correct `allowed_actions`, confirmed by printing `delegation_id`/`allowed_actions`.
 Skip if behind: none — this is core to the system.
+Status: **DONE (2026-08-20)** — `armoriq/delegation.py` (verified scope matrix: log `["search_logs"]`, diagnosis `["get_service_status","inspect_service_state"]` — **restart_service excluded**, remediation `["restart_service"]`; scope validated before any network call via `ScopeValidationError`; each delegation key-bound to the child's own Ed25519 public key; `AEGISOPS_DELEGATION_VALIDITY` default 300s; in-memory `DelegationRecord`; safe metadata only). Commander `_delegate_intents` runs after a successful intent handshake; tokens live only on the in-memory context and are transported only to the owning child; `IncidentResult` exposes `delegations` / `delegation_error` / `governed` (safe metadata). Delegation failure keeps the incident unguarded (Phase 4 safety net) and is reported honestly + audited — nothing faked.
 
-### Phase 7 — Wire invoke() into every MCP call (45 min)
-Tasks: replace direct MCP HTTP calls in each agent with `client.invoke(mcp, action, token, params)`.
-Done when: Log/Diagnosis Agents' authorized calls succeed through ArmorIQ; results match Phase 4's unguarded behavior.
+### Phase 7 — Wire invoke() into the governed MCP calls (45 min)
+Tasks: when a child holds a delegation, route its MCP call through `client.invoke(mcp, action, token, params, user_email)`; otherwise keep the direct MCP call (unguarded baseline).
+Done when: Log/Diagnosis/Remediation Agents' governed calls go through ArmorIQ when a delegation is present; results match Phase 4's unguarded behavior; rejections surface with the verified exception type and are mirrored to the SQLite audit table.
 Skip if behind: none.
+Status: **DONE (2026-08-20)** — `invoke_governed` (`agents/common.py`) is the single governed path (mode selected by authority presence, no env flag): `IntentToken.model_validate` → `client.invoke(..., user_email=<child email>)` → parsed `MCPInvocationResult`; `ArmorIQException` subclasses are surfaced as `AgentError` with `type(exc).__name__` recorded (no hardcoded block class) and an audit row written (`blocked` for `PolicyBlockedException`, `error` otherwise). Log Agent: `log-mcp.search_logs`; Diagnosis Agent: `diagnostic-mcp` read-only tools (defers the restart in governed mode — it holds no restart authority); Remediation Agent: `remediation-mcp.restart_service` (health probe stays a direct read-only call). SQLite audit mirror `database/audit.py` (safe metadata only; `_FORBIDDEN_FIELDS` enforced + tested; `AEGISOPS_AUDIT_DB`; best-effort writes). `tests/test_phase67.py` (17 tests); full suite 110 tests pass. Deliberately NOT done here: enforcement demonstrations, token-expiry demo, post-diagnosis re-delegation, proxy flow against registered MCPs (Phase 8+).
 
 ### Phase 8 — The violation + enforcement (45 min)
 Tasks: Diagnosis Agent attempts `invoke("remediation-mcp","restart_service", diag_delegation.delegated_token, ...)`; catch and log the block; write `audit_events` row.

@@ -110,6 +110,12 @@ def test_full_incident_flow_resolves_with_real_restart(agents_layer):
     assert result["intent_token_error"] and "ARMORIQ_API_KEY" in result["intent_token_error"]
     assert result["intent_token_expires_at"] is None
 
+    # Phase 6/7: with no ArmorIQ connection there is no root token to delegate
+    # from, so the incident runs UNGUARDED (Phase 4 baseline) - reported
+    # honestly as zero delegations and governed=False.
+    assert result["delegations"] == []
+    assert result["governed"] is False
+
     # The Docker container genuinely restarted (start time changed) and is healthy
     started_after = container_started_at()
     assert started_after == diag["remediation_result"]["started_at"], "reported restart must match docker"

@@ -18,16 +18,38 @@ from fastapi import FastAPI
 from agents.common import (
     DIAGNOSTIC_MCP_URL,
     REMEDIATION_MCP_URL,
+    AgentError,
     MCPToolError,
     RemediationRequest,
     RemediationResult,
     call_mcp,
+    invoke_governed,
     log_event,
     make_logger,
 )
 
 app = FastAPI(title="remediation-agent", version="0.4.0")
 logger = make_logger("remediation-agent")
+
+
+async def _restart(req: RemediationRequest) -> dict:
+    """Governed path (Agent -> ArmorIQ invoke -> remediation-mcp) when the
+    Commander delegated restart_service authority; otherwise the unguarded
+    direct MCP path (Phase 4 baseline, preserved for regression)."""
+    if req.authority is not None:
+        log_event(logger, req.incident_id, "restart_governed", "running",
+                  delegation_id=req.authority.delegation_id)
+        return invoke_governed(
+            agent="remediation_agent",
+            authority=req.authority,
+            mcp="remediation-mcp",
+            action="restart_service",
+            params={"service_name": req.service},
+            incident_id=req.incident_id,
+        )
+    return await call_mcp(
+        REMEDIATION_MCP_URL, "restart_service", {"service_name": req.service}
+    )
 
 
 @app.get("/health")
@@ -53,9 +75,7 @@ async def run_task(req: RemediationRequest) -> RemediationResult:
                 status="ok",
             )
 
-        result = await call_mcp(
-            REMEDIATION_MCP_URL, "restart_service", {"service_name": req.service}
-        )
+        result = await _restart(req)
         log_event(logger, req.incident_id, "restart_completed", "ok",
                   container=result.get("container"),
                   started_at=result.get("started_at"))
@@ -70,7 +90,7 @@ async def run_task(req: RemediationRequest) -> RemediationResult:
             health=result.get("health"),
             status="ok",
         )
-    except MCPToolError as exc:
+    except (MCPToolError, AgentError) as exc:
         log_event(logger, req.incident_id, "restart_failed", "error", error=str(exc))
         return RemediationResult(
             incident_id=req.incident_id,

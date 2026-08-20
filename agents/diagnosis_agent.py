@@ -31,6 +31,7 @@ from agents.common import (
     DiagnosisResult,
     MCPToolError,
     call_mcp,
+    invoke_governed,
     log_event,
     make_logger,
 )
@@ -39,9 +40,24 @@ app = FastAPI(title="diagnosis-agent", version="0.4.0")
 logger = make_logger("diagnosis-agent")
 
 
-async def _gather_state(service: str, incident_id: str) -> tuple[dict, dict]:
-    status = await call_mcp(DIAGNOSTIC_MCP_URL, "get_service_status", {"service": service})
-    state = await call_mcp(DIAGNOSTIC_MCP_URL, "inspect_service_state", {"service": service})
+async def _mcp_call(req: DiagnosisRequest, tool: str, params: dict) -> dict:
+    """Governed (Agent -> ArmorIQ invoke -> diagnostic-mcp) when the Commander
+    delegated authority to this agent; otherwise the unguarded direct path."""
+    if req.authority is not None:
+        return invoke_governed(
+            agent="diagnosis_agent",
+            authority=req.authority,
+            mcp="diagnostic-mcp",
+            action=tool,
+            params=params,
+            incident_id=req.incident_id,
+        )
+    return await call_mcp(DIAGNOSTIC_MCP_URL, tool, params)
+
+
+async def _gather_state(service: str, incident_id: str, req: DiagnosisRequest | None = None) -> tuple[dict, dict]:
+    status = await _mcp_call(req, "get_service_status", {"service": service})
+    state = await _mcp_call(req, "inspect_service_state", {"service": service})
     log_event(logger, incident_id, "state_inspected", "ok", http_code=status.get("http_code"),
               running=state.get("running"), health_status=state.get("health_status"))
     return status, state
@@ -72,14 +88,15 @@ async def health() -> dict:
 @app.post("/run_task")
 async def run_task(req: DiagnosisRequest) -> DiagnosisResult:
     log_event(logger, req.incident_id, "diagnosis_started", "running", service=req.service)
+    governed = req.authority is not None
     try:
-        status, state = await _gather_state(req.service, req.incident_id)
+        status, state = await _gather_state(req.service, req.incident_id, req)
         output, llm_source = await _produce_diagnosis(
             req.service, [e.model_dump() for e in req.evidence], status, state, req.incident_id
         )
         log_event(logger, req.incident_id, "diagnosis_produced", "ok",
                   llm_source=llm_source, requires_remediation=output.requires_remediation,
-                  recommended_action=output.recommended_action)
+                  recommended_action=output.recommended_action, governed=governed)
 
         remediation_attempted = False
         remediation_result = None
@@ -92,14 +109,23 @@ async def run_task(req: DiagnosisRequest) -> DiagnosisResult:
                 raise AgentError(
                     f"model targeted '{output.target_service}' but incident is about '{req.service}'"
                 )
-            log_event(logger, req.incident_id, "remediation_requested", "running",
-                      action=output.recommended_action, target=output.target_service)
-            remediation_result = await call_mcp(
-                REMEDIATION_MCP_URL, "restart_service", {"service_name": output.target_service}
-            )
-            remediation_attempted = True
-            log_event(logger, req.incident_id, "remediation_attempted", "ok",
-                      success=bool(remediation_result.get("success")))
+            if governed:
+                # Governed mode: this agent's delegated authority intentionally
+                # EXCLUDES restart_service (verified authority matrix). The
+                # restart is performed only by the Remediation Agent. The
+                # deliberate blocked-attempt demonstration arrives in Phase 8.
+                log_event(logger, req.incident_id, "remediation_deferred", "ok",
+                          reason="governed mode: diagnosis authority excludes restart_service; "
+                                 "remediation agent performs the restart")
+            else:
+                log_event(logger, req.incident_id, "remediation_requested", "running",
+                          action=output.recommended_action, target=output.target_service)
+                remediation_result = await call_mcp(
+                    REMEDIATION_MCP_URL, "restart_service", {"service_name": output.target_service}
+                )
+                remediation_attempted = True
+                log_event(logger, req.incident_id, "remediation_attempted", "ok",
+                          success=bool(remediation_result.get("success")))
 
         return DiagnosisResult(
             incident_id=req.incident_id,

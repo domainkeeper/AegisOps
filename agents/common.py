@@ -92,6 +92,7 @@ class InvestigationRequest(BaseModel):
     service: str = Field(min_length=1, max_length=64)
     keyword: str | None = None
     limit: int = 50
+    authority: "DelegatedAuthority | None" = None
 
     @field_validator("limit")
     @classmethod
@@ -99,6 +100,22 @@ class InvestigationRequest(BaseModel):
         if not 1 <= v <= 500:
             raise ValueError("limit must be between 1 and 500")
         return v
+
+
+class DelegatedAuthority(BaseModel):
+    """A delegated token handed to a child agent for the governed path.
+
+    SENSITIVE: `token` is the serialized IntentToken. It is transported only
+    to the owning child over the local agent HTTP channel, kept in memory,
+    and NEVER logged, persisted, or returned in API responses.
+    """
+
+    agent: str = Field(min_length=1, max_length=64)
+    delegation_id: str = Field(min_length=1, max_length=128)
+    allowed_actions: list[str] = []
+    expires_at: float = 0.0
+    target_agent: str | None = None
+    token: dict[str, Any] = {}
 
 
 class EvidenceLine(BaseModel):
@@ -121,6 +138,7 @@ class DiagnosisRequest(BaseModel):
     evidence: list[EvidenceLine] = []
     status: dict[str, Any] = {}
     state: dict[str, Any] = {}
+    authority: DelegatedAuthority | None = None
 
 
 class DiagnosisResult(BaseModel):
@@ -142,6 +160,7 @@ class DiagnosisResult(BaseModel):
 class RemediationRequest(BaseModel):
     incident_id: str = Field(min_length=1, max_length=128)
     service: str = Field(min_length=1, max_length=64)
+    authority: DelegatedAuthority | None = None
 
 
 class RemediationResult(BaseModel):
@@ -180,6 +199,11 @@ class IncidentResult(BaseModel):
     intent_token_status: str = "not_configured"  # ready | error | not_configured
     intent_token_expires_at: str | None = None
     intent_token_error: str | None = None
+    # Phase 6 (delegation): safe metadata only - delegation ids, scopes,
+    # expiry. Tokens are never serialized here.
+    delegations: list[dict[str, Any]] = []
+    delegation_error: str | None = None
+    governed: bool = False  # True when this run went Agent -> ArmorIQ -> MCP
     timeline: list[TimelineEvent] = []
     error: str | None = None
 
@@ -282,3 +306,78 @@ async def post_json(url: str, payload: dict, timeout: float = DEFAULT_TIMEOUT_S)
         return resp.json()
     except json.JSONDecodeError as exc:
         raise AgentError(f"POST {url} returned non-JSON body") from exc
+
+
+def invoke_governed(
+    *,
+    agent: str,
+    authority: DelegatedAuthority,
+    mcp: str,
+    action: str,
+    params: dict,
+    incident_id: str,
+) -> dict:
+    """Agent -> ArmorIQ invoke() -> MCP -> real resource (governed path).
+
+    Uses the child's delegated token (received over HTTP from the Commander)
+    and the child's own per-agent email scope. Verified against armoriq-sdk
+    0.6.10: invoke(mcp, action, intent_token, params, merkle_proof, user_email).
+
+    ArmorIQ rejects are surfaced, never swallowed: any ArmorIQException is
+    recorded in the local audit mirror with its verified type name and raised
+    as AgentError so the Commander marks the incident FAILED. No exception
+    class is hardcoded for the block case - we catch the verified base class
+    (armoriq_sdk.ArmorIQException) and let the actual type flow through.
+    """
+    from armoriq.client_setup import agent_email, get_client
+    from armoriq_sdk import ArmorIQException
+    from armoriq_sdk.models import IntentToken
+    from database.audit import audit
+
+    token = IntentToken.model_validate(authority.token)
+    email = agent_email(agent)
+
+    try:
+        result = get_client().invoke(
+            mcp=mcp,
+            action=action,
+            intent_token=token,
+            params=params,
+            user_email=email,
+        )
+    except ArmorIQException as exc:
+        error_type = type(exc).__name__
+        audit(
+            incident_id=incident_id,
+            agent=agent,
+            parent_agent="commander",
+            action=f"{mcp}.{action}",
+            status="blocked" if error_type in ("PolicyBlockedException",) else "error",
+            delegation_id=authority.delegation_id,
+            error_type=error_type,
+            detail=str(exc)[:400],
+        )
+        raise AgentError(
+            f"ArmorIQ governed call {mcp}.{action} rejected ({error_type}): {exc}"
+        ) from exc
+
+    audit(
+        incident_id=incident_id,
+        agent=agent,
+        parent_agent="commander",
+        action=f"{mcp}.{action}",
+        status="success",
+        delegation_id=authority.delegation_id,
+        error_type=None,
+        detail=f"verified={getattr(result, 'verified', None)}, execution_time={getattr(result, 'execution_time', None)}",
+    )
+
+    payload = getattr(result, "result", None)
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise AgentError(f"ArmorIQ invoke {mcp}.{action} returned non-JSON payload") from exc
+    if isinstance(payload, dict):
+        return payload
+    raise AgentError(f"ArmorIQ invoke {mcp}.{action} returned unexpected payload type")
