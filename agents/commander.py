@@ -20,10 +20,11 @@ swallowed.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from agents.common import (
     DIAGNOSTIC_MCP_URL,
@@ -52,6 +53,14 @@ logger = make_logger("commander-agent")
 
 RESOLVED = "RESOLVED"
 FAILED = "FAILED"
+
+# In-flight incident dedup: the Commander handles one incident at a time per
+# incident_id. A duplicate request while the original is still running is
+# rejected with a clear 409 - never silently re-run or clobbered. Once the
+# original finishes, re-submitting the same id starts a fresh run (remediation
+# itself stays idempotent via the healthy no-op guard).
+_active_incidents: set[str] = set()
+_active_lock = asyncio.Lock()
 
 
 class IncidentContext:
@@ -237,6 +246,13 @@ def _authority_for(ctx: IncidentContext, agent: str) -> "DelegatedAuthority | No
     return DelegatedAuthority.model_validate(record.authority_payload())
 
 
+def _armoriq_configured() -> bool:
+    """Lazy probe: is a real ARMORIQ_API_KEY configured? (never blocks startup)."""
+    from armoriq.plan import armoriq_configured
+
+    return armoriq_configured()
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"agent": "commander-agent", "status": "ok"}
@@ -244,6 +260,25 @@ async def health() -> dict:
 
 @app.post("/incident")
 async def handle_incident(incident: Incident) -> IncidentResult:
+    # Reject duplicate in-flight incidents (deterministic, never clobbered).
+    async with _active_lock:
+        if incident.incident_id in _active_incidents:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": f"incident '{incident.incident_id}' is already in progress",
+                    "incident_id": incident.incident_id,
+                },
+            )
+        _active_incidents.add(incident.incident_id)
+    try:
+        return await _handle_incident_flow(incident)
+    finally:
+        async with _active_lock:
+            _active_incidents.discard(incident.incident_id)
+
+
+async def _handle_incident_flow(incident: Incident) -> IncidentResult:
     ctx = IncidentContext(incident)
     log_event(logger, incident.incident_id, "incident_received", "running",
               service=incident.service, severity=incident.severity,
@@ -251,6 +286,11 @@ async def handle_incident(incident: Incident) -> IncidentResult:
     ctx.stage("incident_received", "ok")
 
     # Phase 5 intent handshake (best-effort, never blocks orchestration).
+    # While the intent/delegation handshake is running the incident is
+    # WAITING_AUTHORIZATION - it must not act on resources before authority
+    # (root token + child delegations) is resolved.
+    if _armoriq_configured():
+        ctx.status = "WAITING_AUTHORIZATION"
     _capture_intent(ctx)
 
     try:
@@ -289,6 +329,7 @@ async def handle_incident(incident: Incident) -> IncidentResult:
         ctx.diagnosis = DiagnosisResult.model_validate(resp)
         if ctx.diagnosis.status == "error":
             raise AgentError(f"diagnosis-agent failed: {ctx.diagnosis.error}")
+        ctx.status = "DIAGNOSED"
         ctx.stage("diagnosed", "ok",
                   detail=f"requires_remediation={ctx.diagnosis.requires_remediation}")
         log_event(logger, incident.incident_id, "diagnosis_completed", "ok",

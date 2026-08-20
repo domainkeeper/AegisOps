@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
     detail        TEXT,
     created_at    TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_audit_incident ON audit_events(incident_id);
+CREATE INDEX IF NOT EXISTS idx_audit_created  ON audit_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_delegation ON audit_events(delegation_id);
 """
 
 _FORBIDDEN_FIELDS = ("token", "raw_token", "jwt_token", "signature", "api_key", "private_key", "secret")
@@ -67,7 +70,7 @@ class AuditStore:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         with self._lock:
-            self._conn.execute(SCHEMA)
+            self._conn.executescript(SCHEMA)
             self._conn.commit()
 
     def record(
@@ -114,6 +117,19 @@ class AuditStore:
                 "error_type, detail, created_at FROM audit_events "
                 "ORDER BY id DESC LIMIT ?",
                 (limit,),
+            ).fetchall()
+        cols = ["incident_id", "agent", "parent_agent", "action", "status",
+                "delegation_id", "error_type", "detail", "created_at"]
+        return [dict(zip(cols, row)) for row in rows]
+
+    def by_incident(self, incident_id: str, limit: int = 200) -> list[dict]:
+        """All audit rows for one incident, oldest first (indexed by incident_id)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT incident_id, agent, parent_agent, action, status, delegation_id, "
+                "error_type, detail, created_at FROM audit_events "
+                "WHERE incident_id = ? ORDER BY id ASC LIMIT ?",
+                (incident_id, limit),
             ).fetchall()
         cols = ["incident_id", "agent", "parent_agent", "action", "status",
                 "delegation_id", "error_type", "detail", "created_at"]

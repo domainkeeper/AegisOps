@@ -7,6 +7,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
+# Run as an unprivileged user - the app only serves HTTP and needs no root.
+RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

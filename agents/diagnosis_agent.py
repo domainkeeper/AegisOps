@@ -27,6 +27,7 @@ from agents.common import (
     DIAGNOSTIC_MCP_URL,
     REMEDIATION_MCP_URL,
     AgentError,
+    ArmorIQRejection,
     DiagnosisRequest,
     DiagnosisResult,
     MCPToolError,
@@ -99,7 +100,19 @@ def attempt_governed_restart(req: DiagnosisRequest, service: str) -> dict:
             incident_id=req.incident_id,
         )
         log_event(logger, req.incident_id, "remediation_attempt_governed", "ok", allowed=True)
-        return {"attempted": True, "blocked": False, "error": None, "result": result}
+        return {"attempted": True, "blocked": False, "error": None, "result": result,
+                "error_type": None}
+    except ArmorIQRejection as exc:
+        message = str(exc)
+        log_event(logger, req.incident_id, "remediation_attempt_governed", "error",
+                  error=message[:300], error_type=exc.error_type)
+        return {
+            "attempted": True,
+            "blocked": exc.blocked,
+            "error": message,
+            "result": None,
+            "error_type": exc.error_type,
+        }
     except AgentError as exc:
         message = str(exc)
         log_event(logger, req.incident_id, "remediation_attempt_governed", "error",
@@ -109,6 +122,7 @@ def attempt_governed_restart(req: DiagnosisRequest, service: str) -> dict:
             "blocked": "PolicyBlockedException" in message,
             "error": message,
             "result": None,
+            "error_type": None,
         }
 
 

@@ -286,3 +286,88 @@ def test_remediation_rejects_missing_required_param(environment, spawn_server):
             return await client.call_tool("restart_service", {})
     result = asyncio.run(run())
     assert result.is_error
+
+
+# ---------------------------------------------------------------------------
+# Hostile-input hardening (final engineering pass)
+# ---------------------------------------------------------------------------
+
+
+def test_log_mcp_hostile_since_never_shells_out(environment, spawn_server):
+    """A hostile `since` value is passed to docker as a FIXED argument (no shell),
+    never executed. The server either rejects it cleanly or returns valid lines -
+    and auth-api is untouched either way."""
+    url = spawn_server("mcp_servers.log_mcp", 8081)
+    import asyncio
+
+    async def run():
+        async with Client(url) as client:
+            results = []
+            for since in ("not-a-real-time; rm -rf /", "2026-01-01T00:00:00Z --follow", "`id`"):
+                results.append(await client.call_tool(
+                    "search_logs", {"service": "auth-api", "since": since, "limit": 5}
+                ))
+            return results
+    results = asyncio.run(run())
+    for result in results:
+        assert result.is_error or _tool_result_text(result)["service"] == "auth-api"
+    status, _ = _http("GET", AUTH_API_HEALTH_URL)
+    assert status == 200, "auth-api must be untouched by hostile since values"
+
+
+def test_log_mcp_rejects_non_string_service(environment, spawn_server):
+    url = spawn_server("mcp_servers.log_mcp", 8081)
+    import asyncio
+
+    async def run():
+        async with Client(url) as client:
+            results = []
+            for bad in (123, ["auth-api"], {"service": "auth-api"}, None, True):
+                results.append(await client.call_tool("search_logs", {"service": bad}))
+            return results
+    for result in asyncio.run(run()):
+        assert result.is_error, "non-string service values must be rejected"
+
+
+def test_diagnostic_rejects_non_string_service(environment, spawn_server):
+    url = spawn_server("mcp_servers.diagnostic_mcp", 8082)
+    import asyncio
+
+    async def run():
+        async with Client(url) as client:
+            results = []
+            for bad in (0, ["auth-api"], True):
+                results.append(await client.call_tool("get_service_status", {"service": bad}))
+            return results
+    for result in asyncio.run(run()):
+        assert result.is_error
+
+
+def test_log_mcp_rejects_huge_limit(environment, spawn_server):
+    url = spawn_server("mcp_servers.log_mcp", 8081)
+    import asyncio
+
+    async def run():
+        async with Client(url) as client:
+            return await client.call_tool(
+                "search_logs", {"service": "auth-api", "limit": 99999}
+            )
+    result = asyncio.run(run())
+    assert result.is_error, "limits above the documented cap must be rejected"
+
+
+def test_remediation_rejects_list_service_name(environment, spawn_server):
+    """The restart capability must never accept a container list / compound value."""
+    url = spawn_server("mcp_servers.remediation_mcp", 8083)
+    import asyncio
+
+    async def run():
+        async with Client(url) as client:
+            results = []
+            for bad in (["auth-api"], {"service": "auth-api"}, 8080, None):
+                results.append(await client.call_tool("restart_service", {"service_name": bad}))
+            return results
+    for result in asyncio.run(run()):
+        assert result.is_error
+    status, _ = _http("GET", AUTH_API_HEALTH_URL)
+    assert status == 200, "auth-api must be untouched after rejected hostile calls"
