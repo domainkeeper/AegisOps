@@ -102,8 +102,15 @@ flowchart TB
 
 ## 4. Agent Architecture
 
+> **Phase 4 status (2026-08-20):** all four agents are implemented and running as genuinely separate
+> processes WITHOUT ArmorIQ — the **unguarded baseline**. §4.1–§4.4 below document the ArmorIQ-enabled
+> design (future phases); §4.5–§4.9 document what is actually implemented and running now. The two must not
+> be confused: today there are no keypairs, no tokens, no proxy — the agents call the MCPs directly over
+> localhost HTTP, and the Diagnosis Agent's restart attempt succeeds.
+
 All four agents are **separate Python processes** (`agents/*.py`), started independently, each generating its
-own Ed25519 keypair at startup and holding its own `ArmorIQClient` (its own ArmorIQ identity). Inter-agent
+own Ed25519 keypair at startup and holding its own `ArmorIQClient` (its own ArmorIQ identity) **in the
+ArmorIQ phases**; in Phase 4 there is no identity layer yet. Inter-agent
 communication is HTTP: each agent exposes one `/run_task` endpoint; the Commander sends the delegated token +
 task over HTTP. See PLAN.md §5.
 
@@ -163,6 +170,105 @@ task over HTTP. See PLAN.md §5.
 | **MCP tools** | `remediation-mcp` → `restart_service`. |
 | **Who delegates to it** | Commander (only after diagnosis concludes a restart is needed — the "Commander decides to escalate" beat). |
 | **Out-of-scope attempt** | Any non-restart action → blocked by proxy. |
+
+### 4.5 Phase 4 implemented design — contracts
+
+Structured JSON contracts (pydantic models in `agents/common.py`), small by design — no event bus, no broker:
+
+| Contract | Fields | Used by |
+|---|---|---|
+| `Incident` | `incident_id`, `service`, `description`, `severity` (low/medium/high/critical), `timestamp` | demo script → Commander `POST /incident` |
+| `InvestigationRequest` | `incident_id`, `service`, `keyword?`, `limit` (1–500) | Commander → Log Agent |
+| `InvestigationResult` | `incident_id`, `service`, `evidence[{index, text}]`, `summary`, `status`, `error?` | Log Agent → Commander |
+| `DiagnosisRequest` | `incident_id`, `service`, `evidence[]`, `status`, `state` | Commander → Diagnosis Agent |
+| `DiagnosisResult` | `incident_id`, `service`, `diagnosis`, `confidence`, `root_cause`, `requires_remediation`, `recommended_action`, `target_service`, `remediation_attempted`, `remediation_result?`, `llm_source` (llm/fallback/none), `status`, `error?` | Diagnosis Agent → Commander |
+| `RemediationRequest` | `incident_id`, `service` | Commander → Remediation Agent |
+| `RemediationResult` | `incident_id`, `service`, `operation`, `success`, `noop`, `container?`, `started_at_before?`, `started_at?`, `health?`, `status`, `error?` | Remediation Agent → Commander |
+| `IncidentResult` | `incident_id`, `status` (RESOLVED/FAILED), `service`, `investigation?`, `diagnosis?`, `remediation?`, `verification?`, `timeline[{ts, stage, status, detail}]`, `error?` | Commander → caller |
+
+Peer responses are validated on receipt (pydantic) — an invalid response from any agent fails the incident
+explicitly, never silently. Task-level failures return `status: "error"` + `error` in the 200 body; malformed
+requests get HTTP 4xx from the framework.
+
+### 4.6 Phase 4 implemented design — communication
+
+All agents are HTTP servers (FastAPI/uvicorn). The Commander is the only orchestrator; peers never talk to
+each other. Deterministic, one incident at a time (in-memory context):
+
+```
+User / demo script (scripts/run_incident.sh)
+        │  POST /incident {incident_id, service, severity, description}
+        ▼
+   ┌─────────────────────────┐
+   │   Commander (8094)      │   owns IncidentContext: RECEIVED → INVESTIGATING → DIAGNOSING
+   │   POST /incident        │   → REMEDIATING → VERIFYING → RESOLVED | FAILED (timeline kept)
+   └──────┬───────┬───────┬──┘
+          │       │       │
+          │ POST /run_task   │ POST /run_task            │ POST /run_task
+          │ InvestigationReq │ DiagnosisReq (evidence)   │ RemediationReq
+          ▼       ▼          ▼                           ▼
+   Log Agent (8091)   Diagnosis Agent (8092)      Remediation Agent (8093)
+        │                    │                            │
+        │ log-mcp            │ diagnostic-mcp             │ diagnostic-mcp (idempotency
+        │ search_logs        │ get_service_status         │ health check first)
+        │                    │ inspect_service_state      │
+        │                    │ LLM or marked fallback     │ remediation-mcp
+        │                    │ remediation-mcp            │ restart_service
+        │                    │ restart_service (UNGUARDED)│      │
+        ▼                    ▼                            ▼      ▼
+   ┌────────────────────────────────────────────────────────────────┐
+   │                  MCP layer (log 8081 / diagnostic 8082 /       │
+   │                       remediation 8083)  →  Docker  →  auth-api │
+   └────────────────────────────────────────────────────────────────┘
+```
+
+Failure boundaries (§12): a dead peer, MCP error, LLM failure, or invalid response always produces a
+structured `FAILED` IncidentResult with the error in `result.error` and an `incident_failed` timeline entry.
+Nothing is silently swallowed; the Commander never performs the Docker restart itself.
+
+### 4.7 Phase 4 implemented design — end-to-end incident flow
+
+The complete unguarded workflow (proven by `tests/test_e2e.py` and `scripts/run_incident.sh`):
+
+1. `auth-api` is healthy (`/health` → 200).
+2. `POST /break` → `/health` → 503 (`unhealthy`).
+3. Commander receives the incident.
+4. Commander → Log Agent → `search_logs("auth-api")` → evidence + summary.
+5. Commander → Diagnosis Agent with evidence → `get_service_status` + `inspect_service_state`.
+6. Diagnosis Agent reasons (LLM when `AEGISOPS_LLM_API_KEY` is set; otherwise the explicitly-marked
+   deterministic test fallback) → `{requires_remediation: true, recommended_action: restart_service}`.
+7. **Unguarded baseline:** the Diagnosis Agent itself calls `restart_service("auth-api")` through
+   remediation-mcp → the Docker container really restarts.
+8. Commander → Remediation Agent → health check first → service already healthy → idempotent no-op.
+9. Commander verifies `/health` via diagnostic-mcp → 200.
+10. Incident marked **RESOLVED**.
+
+### 4.8 Phase 4 implemented design — LLM boundary
+
+| Concern | Who handles it |
+|---|---|
+| HTTP, MCP calls, validation, health checks, state transitions, retries/timeouts | **Deterministic code** (agents, MCP layer) |
+| Interpreting logs, combining evidence, root-cause reasoning, writing the diagnosis | **LLM** (Diagnosis Agent only, via `agents/llm.py`) |
+| Strict output schema + action allowlist (`none` / `restart_service`) + service allowlist | **pydantic validation before the output is used** |
+| Deciding whether to remediate / attempting the restart | **Deterministic control flow** — hardcoded: if `requires_remediation` and `recommended_action == "restart_service"` and `target_service == incident.service` |
+
+The model never executes anything: no tool names it invents are honored (schema + allowlist reject them), and
+log lines are framed as untrusted data in the system prompt (prompt-injection guard). LLM failures raise
+`LLMUnavailableError` → the Diagnosis Agent returns a structured error → the incident fails loudly. The
+deterministic test fallback (`AEGISOPS_LLM_FALLBACK=test`, `llm_source: "fallback"`) is the ONLY no-key path
+and is never presented as model-generated.
+
+### 4.9 Phase 4 implemented design — unguarded security baseline
+
+**The Diagnosis Agent can currently reach the remediation capability, and the restart succeeds.**
+
+This is intentional and is the exact path that becomes the **blocked demonstration** once ArmorIQ is
+integrated (Phases 5–8): with delegation in place, the Diagnosis Agent's token will carry only
+`get_service_status` / `inspect_service_state`, so its `restart_service` attempt will be rejected by the
+ArmorIQ Proxy while the Remediation Agent's separately-delegated call succeeds. There is deliberately NO
+in-code rule like `if agent == "diagnosis": deny restart` — Phase 4 is pure agent→MCP connectivity so the
+later block can be attributed entirely to the cryptographic authority layer. This unsafe baseline is what
+the unguarded phase exists to reproduce.
 
 ---
 
@@ -619,17 +725,17 @@ No implementation — the design (PLAN §9, §2):
 
 ## 12. Failure Boundaries
 
-From PLAN §10 — intended behavior only, no complicated recovery:
+From PLAN §10. **Phase 4 implemented behavior**:
 
-| Failure | Intended behavior |
+| Failure | Phase 4 behavior (implemented) |
 |---|---|
-| **LLM fails** (diagnosis rationale) | Narrow prompt; on failure, Diagnosis Agent reports "inconclusive" → Commander does not escalate → incident left `investigating` (safe, demoable state). `DECISION NEEDED`: confirm this fallback at implementation start. |
-| **MCP unavailable** | Agent catches connection error, logs `audit_events` row (`authorization_result='error'`), retries once, then surfaces a clear message; doesn't crash the demo. |
-| **ArmorIQ rejects an action** | Expected for the Diagnosis Agent's restart attempt → caught explicitly, logged as `blocked`. **This is the demo's success case.** |
-| **Invalid tool arguments** | MCP validates required fields (`service` present) → 400-style error → agent logs and stops that step. |
-| **Docker service fails** | `restart_service()` retries once, then reports failure; demo script has manual `docker restart auth-api` fallback. |
-| **Agent crashes** | Independent processes — only that agent stops; Commander logs "no response"; demo script restarts the process. |
-| **Duplicate execution** | Idempotency: before `restart_service`, Remediation Agent checks health; if already healthy, logs a no-op instead of restarting twice. |
+| **LLM fails** (unreachable endpoint, bad key, invalid JSON, schema violation) | `LLMUnavailableError` → Diagnosis Agent returns structured `error` → incident FAILED. Never faked. With no key configured: clear error, unless `AEGISOPS_LLM_FALLBACK=test` selects the explicitly-marked deterministic fallback. |
+| **MCP unavailable / tool error** | `MCPToolError` → the agent returns `status: "error"` in its result → Commander marks FAILED with the reason. |
+| **Peer agent unreachable / invalid response** | `post_json`/pydantic validation raises `AgentError` → Commander marks FAILED. (Proven by test.) |
+| **Service does not recover after restart** | remediation-mcp `restart_service` raises → remediation agent returns error → FAILED. |
+| **Invalid tool arguments** | MCP rejects (allowlist/limit checks); agent surfaces the error. |
+| **Duplicate execution** | Idempotency implemented: Remediation Agent health-checks first; healthy service → `noop: true`, no second restart. |
+| **Agent process crash** | Independent processes — only that agent stops; peers' calls fail fast with a clear error. |
 
 ---
 
@@ -640,10 +746,13 @@ Per PLAN.md §12, plus the three project documents at root:
 ```
 AegisOps/
 ├── agents/
-│   ├── commander.py          # Process 1: plan capture, tokens, delegation, orchestration (Phase 4+)
-│   ├── log_agent.py          # Process 2: search_logs via log-mcp (Phase 4+)
-│   ├── diagnosis_agent.py    # Process 3: status/config + LLM rationale + deterministic blocked attempt (Phase 4+)
-│   └── remediation_agent.py  # Process 4: authorized restart_service (Phase 4+)
+│   ├── __init__.py            # package exports (re-exports contracts/helpers)
+│   ├── common.py              # contracts (pydantic), JSON structured logging, MCP + HTTP transport helpers
+│   ├── llm.py                 # OpenAI-compatible LLM wrapper + strict output validation + marked test fallback
+│   ├── commander.py           # Process 1 (port 8094): orchestration, incident context, RESOLVED/FAILED (Phase 4 - implemented)
+│   ├── log_agent.py           # Process 2 (port 8091): search_logs via log-mcp (Phase 4 - implemented)
+│   ├── diagnosis_agent.py     # Process 3 (port 8092): status/state + LLM diagnosis + UNGUARDED restart attempt (Phase 4 - implemented)
+│   └── remediation_agent.py   # Process 4 (port 8093): idempotent restart via remediation-mcp (Phase 4 - implemented)
 ├── mcp_servers/              # MCP layer (Phase 3 - implemented). NOT named "mcp" (shadows the official SDK package)
 │   ├── common.py             # shared: MCPServer factory, SERVICES allowlist, docker/health helpers, ToolError
 │   ├── spike.py              # minimal transport spike: health_check tool, port 8090 (re-verification artifact)
@@ -663,11 +772,15 @@ AegisOps/
 │   ├── schema.sql            # incidents + audit_events DDL (Phase 7)
 │   └── db.py                 # Thin sqlite3 wrapper (Phase 7)
 ├── tests/
+│   ├── conftest.py            # shared fixtures/helpers: env, MCP+agent spawning, hermetic LLM fallback
 │   ├── test_infrastructure.py # Phase 2: health/break/real-restart lifecycle (5 tests)
 │   ├── test_mcp_spike.py      # Phase 3: transport wire format + spike round-trip (4 tests)
 │   ├── test_mcp_tools.py      # Phase 3: all three MCPs, incl. real restart integration (13 tests)
+│   ├── test_agents_unit.py    # Phase 4: contracts, LLM validation, fallback, lifecycle, no-shell (31 tests)
+│   ├── test_agents_integration.py # Phase 4: real processes + real MCPs + real Docker (7 tests)
+│   ├── test_e2e.py            # Phase 4: full incident -> real restart -> RESOLVED (1 test)
 │   ├── test_authorization.py  # Phase 8: Security path (blocked) + happy path (allowed) — critical
-│   └── test_e2e.py            # Phase 10: Full incident flow + final health assertion
+│   └── test_e2e_authorized.py # Phase 9/10: full flow with ArmorIQ enforcement
 ├── scripts/
 │   ├── armoriq_smoke_test.py  # SDK smoke test (Phase 1): local checks + optional network checks
 │   ├── spike_probe.py         # Phase 3: client probe for the transport spike (spike must be running)
@@ -681,13 +794,15 @@ AegisOps/
 │   ├── discover_tools.sh      # Phase 3: tools/list for one MCP
 │   ├── call_mcp_tool.sh       # Phase 3: invoke one tool with JSON args
 │   ├── stop_mcps.sh           # Phase 3: stop the MCP servers
-│   ├── run_incident.sh        # (future) Kick off Commander with hardcoded incident
+│   ├── start_agents.sh        # Phase 4: start the four agents (background, PID files in logs/agents/)
+│   ├── stop_agents.sh         # Phase 4: stop them
+│   ├── run_incident.sh        # Phase 4: one complete incident end to end (implemented)
 │   └── reset_demo.sh          # compose down -v + up; (future) + clear SQLite rows
 ├── .env.example               # ARMORIQ_API_KEY placeholder + optional endpoint overrides — never the real .env
-├── .gitignore                 # .env, .venv, .keys/, .armoriq/, *.db, logs/, __pycache__
-├── .keys/                     # (gitignored) per-agent Ed25519 keypairs: <agent>.pem + <agent>.pub
+├── .gitignore                 # .env, .venv, .keys/, .armoriq/, *.db, logs/, __pycache__, .pytest_cache
+├── .keys/                     # (gitignored) per-agent Ed25519 keypairs: <agent>.pem + <agent>.pub (Phase 5+)
 ├── docker-compose.yml         # auth-api
-├── requirements.txt
+├── requirements.txt           # + fastapi, uvicorn for the agent processes (Phase 4)
 ├── README.md                 # Public-facing introduction
 ├── PLAN.md                   # Source of truth: what we build
 ├── ARCHITECTURE.md           # This file: how it will be structured
@@ -699,7 +814,10 @@ Phase 2 status: `infrastructure/auth_api/` (main.py, Dockerfile, requirements.tx
 `docker-compose.yml`, six infra scripts, and `tests/test_infrastructure.py` exist.
 Phase 3 status: `mcp_servers/` (common, spike, log_mcp, diagnostic_mcp, remediation_mcp), MCP dev scripts,
 `tests/test_mcp_spike.py` + `tests/test_mcp_tools.py`, and `scripts/spike_probe.py` exist and pass.
-Agents (`agents/`), the database (`database/`), and authorization tests do not exist yet.
+Phase 4 status: `agents/` (common, llm, commander, log_agent, diagnosis_agent, remediation_agent), agent
+scripts, `tests/conftest.py` + `tests/test_agents_unit.py` + `tests/test_agents_integration.py` +
+`tests/test_e2e.py`, and `scripts/run_incident.sh` exist and pass (39 agent tests).
+The database (`database/`) and authorization tests do not exist yet.
 
 ---
 
@@ -724,6 +842,10 @@ Agents (`agents/`), the database (`database/`), and authorization tests do not e
 | 15 | **NEW (Phase 3):** MCP layer uses the **official MCP Python SDK** (`mcp==2.0.0`), Streamable HTTP transport, SSE responses — NOT a hand-rolled protocol | The SDK's wire format matches ArmorIQ's MCP Format Requirements exactly; official + stable | Verified 2026-08-19 (raw wire probe + client round-trip) |
 | 16 | **NEW (Phase 3):** local package named `mcp_servers/`, not `mcp/` | `mcp` is the official SDK's package name — a local `mcp/` directory shadows it | Hit the collision during the spike |
 | 17 | **NEW (Phase 3):** local dev talks to MCPs on localhost directly; ArmorIQ-connected modes = public HTTPS tunnel (deployment concern, no provider hardcoded) OR self-hosted ArmorIQ stack (`use_production=False`); hosted proxy cannot reach localhost | Verified against official docs: registration requires public HTTPS; self-hosting is officially supported | docs.armoriq.ai, 2026-08-19 |
+| 18 | **NEW (Phase 4):** agents are FastAPI/uvicorn processes; agent + MCP URLs env-overridable (`AEGISOPS_*_URL`) | Same framework as the rest of the project; deployable on different hosts later | Phase 4 |
+| 19 | **NEW (Phase 4):** LLM = minimal OpenAI-compatible wrapper (`agents/llm.py`, httpx only) reading `AEGISOPS_LLM_API_KEY/BASE_URL/MODEL` from the environment; NO provider abstraction framework | Smallest practical integration; one provider, swappable via base URL | PLAN §8, Phase 4 |
+| 20 | **NEW (Phase 4):** no LLM key + `AEGISOPS_LLM_FALLBACK=test` → explicitly-marked deterministic fallback (`llm_source: "fallback"`); otherwise a clear error, never a fake model diagnosis | Honesty requirement: reproducible demo/tests without credentials without pretending to be LLM-powered | Phase 4 user instruction |
+| 21 | **NEW (Phase 4):** unguarded baseline — the Diagnosis Agent itself performs the restart through remediation-mcp; no `if agent == "diagnosis"` rule anywhere | Phase 4 must reproduce the unsafe behavior so Phases 5–8 can block the exact same path | Phase 4 |
 
 ---
 
@@ -746,7 +868,7 @@ Agents (`agents/`), the database (`database/`), and authorization tests do not e
 - [ ] Include the optional Postgres container for "real infra" flavor, or cut? (Default: cut unless time is ahead of schedule.)
 - [ ] Trail viewer: minimal HTML page vs terminal/`audit_events` output only? (Default: terminal; HTML only if Phase 10 has time.)
 - [ ] Include the malicious-log prompt-injection beat in the first demo run? (Default: yes — PLAN SHOULD HAVE.)
-- [ ] LLM failure fallback for Diagnosis Agent: report inconclusive and stop (no escalation)? (Default: yes.)
+- [x] ~~LLM failure fallback for Diagnosis Agent~~ — **RESOLVED (Phase 4):** no key → clear error, or the explicitly-marked `AEGISOPS_LLM_FALLBACK=test` deterministic fallback; configured-but-failing → clear error, incident FAILED.
 - [ ] MCP connectivity for the demo: tunnel vs self-hosted proxy vs direct? (New — from proxy/MCP verification.)
 
 ---
@@ -760,7 +882,7 @@ Dependency-aware order from PLAN §13. Each phase is gated on the previous one:
 | 1 | **Project skeleton** — `.gitignore`, `.env.example`, deps, compose skeleton, API key working — **DONE (2026-08-19)**: env on Python 3.12, SDK verified + installed (0.6.10), client/identity foundation (`armoriq/client_setup.py`), smoke test (`scripts/armoriq_smoke_test.py`, local path passes) | Foundation; everything else depends on it |
 | 2 | **Docker infrastructure** — `auth-api` with `/health` `/break` `/fix`; manual break/restart/heal — **DONE (2026-08-19)**: FastAPI service + Dockerfile + root compose + 6 dev scripts; break → 503, real `docker restart auth-api` → healthy (start-time proven); 5/5 tests pass (§9) | MCPs need a real target; proves the real-world effect first |
 | 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` speaking **JSON-RPC 2.0 + SSE** (`initialize`/`tools/list`/`tools/call`), registered on the platform under exact names; resolve local-MCP connectivity first (§8.3) — **DONE (2026-08-19)**: official MCP SDK v2 (mcp==2.0.0), Streamable HTTP; connectivity resolved (§7.2: local = direct localhost, ArmorIQ = tunnel or self-hosted proxy); spike verified; 3 servers + 4 tools; 17/17 MCP tests pass incl. real restart | Agents need tools; tools need infra (Phase 2) and registration |
-| 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
+| 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) — **DONE (2026-08-20)**: `agents/` (commander :8094, log-agent :8091, diagnosis-agent :8092, remediation-agent :8093), pydantic contracts, OpenAI-compatible LLM wrapper + validated schema + marked test fallback, real restart via the diagnosis agent's unguarded attempt, idempotent remediation agent; 39 agent tests pass (31 unit + 7 integration + 1 E2E) plus `scripts/run_incident.sh` runs one incident end to end (§4.5–§4.9) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
 | 5 | **ArmorIQ identities + plan** — per-agent keypairs; `capture_plan()` → `get_intent_token()` | The authorization layer's foundation |
 | 6 | **ArmorIQ delegation** — `delegate()` ×3 with correct `allowed_actions` | Tokens are the currency of Phase 7 |
 | 7 | **Wire `invoke()` into every MCP call** — replace direct HTTP calls | The scenario now runs through ArmorIQ |

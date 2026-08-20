@@ -55,14 +55,25 @@ alternatively the officially supported self-hosted ArmorIQ stack can reach local
 
 ## Agents
 
-| Agent | Identity | Authority (delegated `allowed_actions`) |
-|---|---|---|
-| Commander | own Ed25519 keypair + ArmorIQ client | Root intent token over the full captured plan; the only agent that calls `delegate()` |
-| Log Agent | own keypair + client | `search_logs` |
-| Diagnosis Agent | own keypair + client | `get_service_status`, `inspect_service_state` — **no restart** |
-| Remediation Agent | own keypair + client | `restart_service` (granted by Commander only after diagnosis) |
+Four genuinely separate processes communicating over plain HTTP. This is the current **unguarded** state
+(Phase 4): every agent can reach every capability, and the Diagnosis Agent's restart attempt **succeeds**.
+The ArmorIQ enforcement phases will convert exactly that path into the blocked demonstration.
 
-Each agent is a separate process with its own keypair. No agent can self-escalate.
+| Agent | Process (port) | Talks to (HTTP → MCP) | Role |
+|---|---|---|---|
+| Commander | `agents/commander.py` (8094) | all three agents, `diagnostic-mcp` | Orchestrator: receives incident, drives investigation → diagnosis → remediation → verification, marks RESOLVED/FAILED |
+| Log Agent | `agents/log_agent.py` (8091) | `log-mcp` | Fetches log evidence, returns a compact structured summary |
+| Diagnosis Agent | `agents/diagnosis_agent.py` (8092) | `diagnostic-mcp`, `remediation-mcp` | Inspects state, reasons over evidence (LLM), and in this unguarded phase performs the remediation itself |
+| Remediation Agent | `agents/remediation_agent.py` (8093) | `diagnostic-mcp`, `remediation-mcp` | Executes the restart through the MCP (idempotency guard: healthy service → no-op) |
+
+Agent → MCP → Docker. No agent ever runs `docker` directly; there is no shell tool anywhere.
+
+**LLM (Diagnosis Agent only):** an OpenAI-compatible wrapper (`agents/llm.py`) — `AEGISOPS_LLM_API_KEY`,
+`AEGISOPS_LLM_BASE_URL`, `AEGISOPS_LLM_MODEL` (default `gpt-4o-mini`). The model interprets evidence and
+returns a strict JSON diagnosis which is validated against a schema + an action allowlist
+(`none` / `restart_service` only). The model never executes anything. With no key configured, the agent
+fails clearly — or uses the **explicitly-marked deterministic TEST fallback** when `AEGISOPS_LLM_FALLBACK=test`
+is set (always labelled `llm_source: "fallback"`, never presented as model-generated).
 
 ## ArmorIQ's Role
 
@@ -82,14 +93,19 @@ The first is **blocked** by ArmorIQ. The second **succeeds**. The only differenc
 cryptographically-signed token was presented — enforcement is keyed on the token's allow-list and signed
 plan proof, never on the text of the request and never on what an LLM intends.
 
-## Incident Scenario
+## Incident Scenario (current, unguarded)
 
-1. `auth-api` container is broken (`POST /break`)
-2. Commander captures the plan and delegates scoped tokens
-3. Log + Diagnosis Agents investigate (read-only)
-4. Diagnosis Agent's LLM concludes "restart needed" — and attempts the restart with its own token → **blocked**, logged to the audit trail
-5. Commander explicitly delegates restart authority → Remediation Agent restarts → container heals (`/health` green)
-6. The full audit trail (plan → delegations → blocked → allowed) is shown
+1. `auth-api` container is broken (`POST /break`) — `/health` → 503
+2. The incident is submitted to the Commander (`POST /incident`)
+3. Commander asks the Log Agent to investigate → log evidence
+4. Commander sends the evidence to the Diagnosis Agent → service state + LLM/fallback reasoning
+5. Diagnosis concludes a restart is needed — and (unguarded baseline) **attempts `restart_service("auth-api")` itself** → succeeds
+6. Commander asks the Remediation Agent to confirm → service already healthy, idempotent no-op
+7. Commander verifies `/health` and marks the incident **RESOLVED**
+
+This exact unguarded baseline is the proof that the workflow works before authorization is inserted. In the
+ArmorIQ phases the Diagnosis Agent's restart attempt will be **blocked** (its delegated token has no
+`restart_service` authority) and only the Remediation Agent's separately-delegated call will succeed.
 
 ## Planned Stack
 
@@ -114,8 +130,11 @@ plan proof, never on the text of the request and never on what an LLM intends.
   `/break`, `/fix`; a real `docker restart auth-api` recovers the service (proven by tests + manual run).
 - **MCP layer built and verified** — transport spike passed; three MCP servers with four tools; the
   `restart_service("auth-api")` tool performs a real Docker restart (start time changes, health recovers).
-  17/17 MCP tests pass. ArmorIQ connectivity resolved (see ARCHITECTURE.md §7.2).
-- **Full agent workflow not implemented yet.**
+  ArmorIQ connectivity resolved (see ARCHITECTURE.md §7.2).
+- **Unguarded multi-agent system built and verified** — four independent agent processes orchestrate the
+  complete incident flow over HTTP; the Diagnosis Agent reasons (LLM or marked fallback) and performs the
+  unguarded restart; the container really restarts and the incident reaches RESOLVED. 39 agent tests pass.
+- **ArmorIQ enforcement not implemented yet** — that is the next phase.
 
 ## Current Status
 
@@ -128,11 +147,11 @@ plan proof, never on the text of the request and never on what an LLM intends.
 | SDK smoke test | **Implemented** (local path passes; network path needs a real key) |
 | Docker infrastructure (`auth-api` + compose + scripts) | **Implemented** (`docker-compose.yml`, `infrastructure/auth_api/`, `scripts/`) |
 | Infrastructure tests | **Implemented** (5 tests, all passing — health / break / real restart) |
-| MCP tools | **Implemented** (3 servers, 4 tools; 17 tests passing incl. real restart) |
-| Agent processes | **Planned** |
+| MCP tools | **Implemented** (3 servers, 4 tools; 22 tests passing incl. real restart) |
+| Multi-agent orchestration (unguarded) | **Implemented** (4 processes, HTTP contracts, LLM diagnosis, real restart; 39 tests incl. full E2E) |
 | ArmorIQ plan/delegate/invoke wiring | **Planned** |
 | Database | **Planned** |
-| Demo scripts | **Planned** (dev scripts done; `run_incident.sh` pending) |
+| Demo scripts | **Implemented** (`run_incident.sh` runs one complete incident end to end) |
 
 ## Setup
 
@@ -167,15 +186,37 @@ scripts/call_mcp_tool.sh log-mcp search_logs '{"service":"auth-api","limit":5}'
 scripts/call_mcp_tool.sh remediation-mcp restart_service '{"service_name":"auth-api"}'
 scripts/stop_mcps.sh        # stop the MCP servers
 
+# Agents (requires MCPs; runs on 8091/8092/8093/8094)
+scripts/start_agents.sh     # start log-agent, diagnosis-agent, remediation-agent, commander
+scripts/stop_agents.sh      # stop them
+# Set AEGISOPS_LLM_API_KEY first for real LLM diagnosis; without it the
+# Diagnosis Agent uses the explicitly-marked test fallback (set
+# AEGISOPS_LLM_FALLBACK=test) or fails clearly.
+
+# Run one complete incident end to end (no manual steps):
+scripts/run_incident.sh     # break -> investigate -> diagnose -> restart -> verify -> RESOLVED
+
 # Automated verification (from repo root, requires running Docker):
-python -m pytest tests/test_infrastructure.py -v   # 5 tests - infra lifecycle
-python -m pytest tests/test_mcp_spike.py -v        # 4 tests - transport spike
-python -m pytest tests/test_mcp_tools.py -v        # 13 tests - MCPs incl. real restart
+python -m pytest tests/test_infrastructure.py -v      # 5 tests - infra lifecycle
+python -m pytest tests/test_mcp_spike.py -v           # 4 tests - transport spike
+python -m pytest tests/test_mcp_tools.py -v           # 13 tests - MCPs incl. real restart
+python -m pytest tests/test_agents_unit.py -v         # 31 tests - contracts, LLM validation, fallback
+python -m pytest tests/test_agents_integration.py -v  # 7 tests - real agent processes + MCPs + Docker
+python -m pytest tests/test_e2e.py -v                 # 1 test - full incident, real restart, RESOLVED
+python -m pytest tests/                               # everything (61 tests)
 ```
 
 ## Demo
 
-_Planned._ Will cover: `scripts/start_env.sh`, `scripts/break_service.sh`, `scripts/run_incident.sh`, `scripts/reset_demo.sh` — and what to expect at each step.
+```bash
+scripts/run_incident.sh
+```
+
+One command, zero manual steps: it ensures infrastructure + MCPs + agents are up, breaks `auth-api`, waits
+until `/health` reports unhealthy, submits the incident, and prints the final result (RESOLVED) with the
+evidence count, diagnosis text, LLM source, and verification. The auth-api Docker container genuinely
+restarts in the middle of the flow. No LLM key is required — with `AEGISOPS_LLM_API_KEY` unset it prints a
+notice and uses the explicitly-marked deterministic test fallback for the diagnosis.
 
 ---
 

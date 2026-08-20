@@ -232,6 +232,7 @@ What stays in ArmorIQ vs. local storage: ArmorIQ's platform is the **source of t
 
 **LLM-backed (small, targeted calls):**
 - Diagnosis Agent: given log excerpts + status/config output, decide "does this look like it needs a restart" and produce a short natural-language rationale (this is the "genuinely useful multi-agent" reasoning piece).
+- Phase 4 implementation note (2026-08-20): implemented as a minimal OpenAI-compatible wrapper (`agents/llm.py`; env credentials `AEGISOPS_LLM_API_KEY` / `AEGISOPS_LLM_BASE_URL` / `AEGISOPS_LLM_MODEL`; strict JSON output schema; action + service allowlists). No provider abstraction framework. See ARCHITECTURE.md §4.8.
 - Optionally, Commander: given the incident description, decide which sub-agents to invoke first (can be hardcoded for the single demo scenario if time is short — this is a safe cut).
 
 **Deterministic (no LLM):**
@@ -348,6 +349,7 @@ Skip if behind: combine all three into one process with three routes if MCP sepa
 ### Phase 4 — Agents, unguarded (90 min)
 Tasks: build Commander/Log/Diagnosis/Remediation as separate processes calling MCP tools directly (no ArmorIQ yet), communicating over simple HTTP endpoints; Diagnosis Agent's LLM call to decide "restart needed."
 Done when: end-to-end flow works without any authorization layer — incident → logs → diagnosis → (unchecked) restart → recovery.
+Status: **DONE (2026-08-20)** — `agents/` (commander :8094, log-agent :8091, diagnosis-agent :8092, remediation-agent :8093), pydantic contracts, OpenAI-compatible LLM wrapper + strict output validation + explicitly-marked deterministic TEST fallback (`AEGISOPS_LLM_FALLBACK=test`, `llm_source:"fallback"`; no key + no flag = clear error, never a fake diagnosis), unguarded restart through remediation-mcp, idempotent remediation agent, `scripts/{start_agents,stop_agents,run_incident}.sh`, 39 agent tests (31 unit + 7 integration + 1 E2E); full suite 61 tests pass.
 Skip if behind: hardcode Commander's task dispatch order instead of making it dynamic.
 
 ### Phase 5 — ArmorIQ: identities + plan (60 min)
