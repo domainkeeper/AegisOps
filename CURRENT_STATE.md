@@ -46,7 +46,7 @@ Phase 8/9 (`tests/test_live_authorization.py`, self-skipping; `scripts/run_enfor
 - **Phase 3 (2026-08-19) — MCP tooling layer** — connectivity resolved (public HTTPS for registered MCPs;
   local = direct localhost), transport verified (official `mcp==2.0.0` SDK, Streamable HTTP, SSE), spike
   verified, three servers with four tools (incl. real `restart_service`), allowlist + no-shell security
-  boundary, dev scripts, `tests/test_mcp_spike.py` (4/4) + `tests/test_mcp_tools.py` (13/13).
+  boundary, dev scripts, `tests/test_mcp_spike.py` (4/4) + `tests/test_mcp_tools.py` (18/18, incl. hostile-input hardening).
 - **Phase 4 (2026-08-20) — unguarded multi-agent system**:
   - **Four real processes** — `agents/{commander,log_agent,diagnosis_agent,remediation_agent}.py`
     (ports 8094/8091/8092/8093), each independently executable (`python -m agents.<name>`), each with its
@@ -70,7 +70,7 @@ Phase 8/9 (`tests/test_live_authorization.py`, self-skipping; `scripts/run_enfor
   - **No shell execution** — agents call MCPs over HTTP only; static tests assert no `subprocess` /
     `os.system` / `shell=True` anywhere in `agents/`.
   - **Scripts** — `start_agents.sh`, `stop_agents.sh`, `run_incident.sh` (one-command full incident).
-  - **Tests** — `tests/test_agents_unit.py`, `tests/test_agents_integration.py`, `tests/test_e2e.py`.
+  - **Tests** — `tests/test_agents_unit.py` (34), `tests/test_agents_integration.py` (7), `tests/test_e2e.py` (1).
 - **Phase 5 (2026-08-20) — ArmorIQ identities + explicit plan + intent token**:
   - **Gemini LLM (verified model)** — `agents/llm.py` now uses the official `google-genai` SDK against
     `gemini-3.5-flash-lite` (the current stable GA Flash-Lite model, verified against ai.google.dev,
@@ -96,7 +96,7 @@ Phase 8/9 (`tests/test_live_authorization.py`, self-skipping; `scripts/run_enfor
     responses, and never logged (it carries `raw_token`/`jwt_token`). A missing key is reported honestly as
     `not_configured` and never blocks the unguarded Phase 4 flow. `scripts/armoriq_plan_token.py` runs the
     same handshake standalone for account verification (prints only non-sensitive metadata).
-  - **Tests** — `tests/test_phase5.py` (identity distinctness/round-trip/gitignore, email conventions,
+  - **Tests** — `tests/test_phase5.py` (29 tests: identity distinctness/round-trip/gitignore, email conventions,
     plan build/validation, capture/token handshake via stub clients, honest not_configured/error states,
     token material never serialized). E2E now asserts the 4-step plan + `intent_token_status` in the real
     flow.
@@ -147,7 +147,7 @@ Phase 8/9 (`tests/test_live_authorization.py`, self-skipping; `scripts/run_enfor
     recorded, token material never in `IncidentResult`, governed success propagates MCP results,
     blocked/invalid-token surface + audit rows with the verified error type, audit mirror never stores
     secrets, Phase 8 probe (blocked/unreachable/unexpected-allowance all recorded, never fatal), E2E asserts
-    `delegations: []` + `governed: false` on the no-key run. Full suite: **113 tests pass** (offline;
+    `delegations: []` + `governed: false` on the no-key run. Full suite: **138 tests pass** (offline;
     `tests/test_live_authorization.py` adds 3 live tests that self-skip without the live prerequisites).
   - **Test hygiene** — the suite now reclaims the agent/MCP ports at session start so stale processes left
     by demo scripts can never poison results.
@@ -172,6 +172,42 @@ Phase 8/9 (`tests/test_live_authorization.py`, self-skipping; `scripts/run_enfor
   self-skipping): real delegations with exact scopes, live blocked (StartedAt unchanged + audit blocked),
   live allowed (StartedAt changed + /health 200 + audit success). The live rejection exception class is
   OBSERVED and recorded by these tests — never hardcoded before it is seen.
+- **Final engineering pass (2026-08-20) — hardening + reliability + tooling**:
+  - **Governed-path defense-in-depth** (`agents/common.py` `invoke_governed`): a delegated authority is
+    rejected locally if it is bound to a different agent (`IdentityMismatchError` — closes the token
+    substitution / cross-agent reuse vector); an already-expired authority fails fast with a clear
+    `TokenExpiredException` label + audit row before any network call; EVERY SDK failure (including
+    unexpected non-ArmorIQ errors) is now wrapped in `ArmorIQRejection` with the verified exception type
+    and audited — nothing raw escapes the incident flow. The Phase 8 probe detects blocked outcomes via the
+    structured rejection (`ArmorIQRejection.error_type`), not keyword matching.
+  - **Timeouts + bounded retries** (`agents/common.py`): `call_mcp` now passes a real
+    `read_timeout_seconds` to the MCP client (previously unused) and both `call_mcp`/`post_json` retry ONCE
+    on transient transport failures only (connection refused/reset/read timeout/5xx) — never on tool
+    errors, validation failures, or authorization denials (a retried denial would hide a real decision).
+  - **Commander robustness** (`agents/commander.py`): duplicate in-flight incidents are rejected with a
+    clear 409 (never clobbered); the incident status machine is explicit — RECEIVED →
+    WAITING_AUTHORIZATION (governed intent/delegation handshake) → INVESTIGATING → DIAGNOSED →
+    REMEDIATING → VERIFYING → RESOLVED/FAILED.
+  - **Audit mirror** (`database/audit.py`): query indexes (`incident_id`, `created_at`, `delegation_id`) +
+    a `by_incident()` accessor (the demo script now uses it instead of filtering `recent()`).
+  - **LLM prompt-injection hardening** (`agents/llm.py`): evidence is sanitized before the model call
+    (line count + length caps, control-character stripping, non-string entries dropped) and the system
+    prompt explicitly marks log lines as untrusted DATA vs instructions; `AEGISOPS_LLM_TIMEOUT` /
+    `AEGISOPS_LLM_MODEL` misconfiguration now raises the clear `LLMUnavailableError` instead of a raw
+    `ValueError`. The model output remains constrained by schema + action/service allowlists.
+  - **Hostile-input MCP tests** (`tests/test_mcp_tools.py` +5): `since` injection values, non-string
+    service params (int/list/dict/None/bool), oversized limits — all rejected or data-only, container
+    untouched.
+  - **New `tests/test_security.py` (20 offline tests)** — cross-agent authority rejection, expiry guard,
+    every-invoke-failure-wrapped, narrow retry classification, audit indexes + by_incident, LLM sanitization
+    + injection resistance, state machine + duplicate rejection, no-shell-execution regression.
+  - **Tooling**: `scripts/preflight.py` (+ `.sh`/`.ps1`) — honest human-readable readiness report that
+    never assumes live enforcement (it calls `list_mcps()` and reports MCP registration explicitly);
+    `scripts/check_security.py` (+ `.sh`/`.ps1`) — static scan for event-framing wording, secret leakage,
+    agent-layer shell-execution, and gitignore coverage; Windows `.ps1` wrappers for
+    run_incident/run_enforcement_demo/stop_all; `.env.example` reorganized into LOCAL vs LIVE sections;
+    non-root `auth-api` container; direct dependencies pinned in `requirements.txt`
+    (`pydantic`, `cryptography`, `httpx`).
 
 ## In Progress
 
@@ -223,6 +259,10 @@ Phase 8/9 (`tests/test_live_authorization.py`, self-skipping; `scripts/run_enfor
 | 28 | **NEW (Phase 7):** mode selection by authority presence, not an env flag — request carries a delegation → governed `invoke()`; otherwise the Phase 4 direct-MCP path runs unchanged |
 | 29 | **NEW (Phase 7):** governed rejections are surfaced, never swallowed — the verified `ArmorIQException` type is recorded, audited, and raised as `AgentError`; no hardcoded block class in the code path |
 | 30 | **NEW (Phase 7):** SQLite audit mirror stores safe metadata only (`_FORBIDDEN_FIELDS` enforced + tested); best-effort writes; ArmorIQ remains the authorization source of truth |
+| 31 | **NEW (final pass):** local identity/expiry checks in `invoke_governed` are defense-in-depth only — they close obvious misuse vectors (cross-agent token reuse, expired tokens) but NEVER decide authorization; ArmorIQ stays the enforcement point (deliberate no local action-vs-scope check so the Phase 8 probe exercises the real platform) |
+| 32 | **NEW (final pass):** bounded retry on transient transport failures only (once, 0.5s backoff) — never on tool errors or authorization denials; `call_mcp` passes a real read timeout to the MCP client |
+| 33 | **NEW (final pass):** Commander rejects duplicate in-flight incidents (409) and exposes an explicit status machine (RECEIVED → WAITING_AUTHORIZATION → INVESTIGATING → DIAGNOSED → REMEDIATING → VERIFYING → RESOLVED/FAILED) |
+| 34 | **NEW (final pass):** readiness/static-check tooling (`preflight`, `check_security`) never over-claims — live enforcement readiness is determined by a real `list_mcps()` call and reported honestly |
 
 ## Verified SDK Details
 
@@ -301,6 +341,17 @@ read), 2026-08-19/20:
    (blocked) / changed (allowed) + audit rows.
 5. Phase 10 — testing + audit trail + demo polish (only after the live run).
 
+## Current Test + Tooling Status
+
+- Full offline suite: **138 passed, 3 skipped** (live) — `python -m pytest tests/` from repo root.
+- `tests/test_security.py` (20) — final-pass hardening: governed-path defense-in-depth, retry
+  classification, audit accessors/indexes, LLM sanitization, state machine, no-shell-execution regression.
+- `scripts/preflight.py` / `preflight.sh` / `preflight.ps1` — readiness report (venv, .env, key presence,
+  identities, audit writability, docker + auth-api health, MCPs, agents, live registration via
+  `list_mcps()`); exits 0 (ready) / 1 (failed) / 2 (key missing); `--local-only` for offline machines.
+- `scripts/check_security.py` / `check_security.sh` / `check_security.ps1` — static scan: event-framing
+  wording, secret leakage, agent-layer shell-execution, gitignore coverage. Last run: CLEAN.
+
 ## Blockers
 
 - **MCP registration with public tunnel URLs** — the only remaining blocker for the live Phase 8/9 run: the
@@ -311,7 +362,7 @@ read), 2026-08-19/20:
 
 ## Definition of Ready (Phase 8 — violation + enforcement demonstration)
 
-- [x] Phase 6 + 7 complete (delegation + governed invocation + audit mirror implemented; 113 tests pass)
+- [x] Phase 6 + 7 complete (delegation + governed invocation + audit mirror implemented; 138 tests pass)
 - [x] Diagnosis Agent's delegation excludes `restart_service` (enforced + tested)
 - [x] Governed invocation surfaces ArmorIQ rejections with the verified exception type (stub-tested)
 - [x] Real `ARMORIQ_API_KEY` obtained and verified (real intent tokens + real subtree delegations minted live)

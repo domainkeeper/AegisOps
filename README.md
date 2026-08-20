@@ -158,7 +158,7 @@ same action string, different cryptographically delegated authority, different r
   ArmorIQ connectivity resolved (see ARCHITECTURE.md §7.2).
 - **Unguarded multi-agent system built and verified** — four independent agent processes orchestrate the
   complete incident flow over HTTP; the Diagnosis Agent reasons (Gemini or marked fallback) and performs the
-  unguarded restart; the container really restarts and the incident reaches RESOLVED. 39 agent tests pass.
+  unguarded restart; the container really restarts and the incident reaches RESOLVED. 42 agent tests pass.
 - **Identities + plan + intent token built (Phase 5)** — per-agent Ed25519 keypairs (`.keys/<role>/`,
   gitignored) + email scopes; explicit 4-step plan (`armoriq/plan.py`); Commander `capture_plan()` →
   `get_intent_token()` on every incident with the token never stored/logged/serialized; standalone
@@ -180,6 +180,15 @@ same action string, different cryptographically delegated authority, different r
   `StartedAt`). Live proof still requires the MCPs registered on the ArmorIQ platform with public tunnel
   URLs (see ARCHITECTURE.md §7.2); `tests/test_live_authorization.py` verifies blocked + allowed against the
   real platform and self-skips when the live prerequisites are missing.
+- **Final engineering pass (hardening + reliability + tooling)** — defense-in-depth on the governed path
+  (cross-agent token substitution rejected, expired authorities fail fast, every SDK failure wrapped +
+  audited with its verified type); real timeouts on MCP calls + bounded retry on transient transport
+  failures only (never on tool errors or denials); Commander duplicate in-flight rejection + explicit
+  incident state machine; SQLite audit query indexes + `by_incident`; LLM evidence sanitization against
+  prompt injection (bounds, control-char stripping, DATA-vs-instructions reinforcement); hostile-input MCP
+  tests; `scripts/preflight.py` readiness report and `scripts/check_security.py` static scan (event-framing
+  wording, secret leakage, shell-execution, gitignore coverage); Windows `.ps1` wrappers; non-root
+  `auth-api` container. `tests/test_security.py` (20 tests).
 
 ## Current Status
 
@@ -193,14 +202,15 @@ same action string, different cryptographically delegated authority, different r
 | Docker infrastructure (`auth-api` + compose + scripts) | **Implemented** (`docker-compose.yml`, `infrastructure/auth_api/`, `scripts/`) |
 | Infrastructure tests | **Implemented** (5 tests, all passing — health / break / real restart) |
 | MCP tools | **Implemented** (3 servers, 4 tools; 22 tests passing incl. real restart) |
-| Multi-agent orchestration (unguarded) | **Implemented** (4 processes, HTTP contracts, Gemini diagnosis, real restart; 39 tests incl. full E2E) |
+| Multi-agent orchestration (unguarded) | **Implemented** (4 processes, HTTP contracts, Gemini diagnosis, real restart; 42 tests incl. full E2E) |
 | Agent identities (Phase 5) | **Implemented** (`.keys/<role>/` Ed25519 keypairs + `AEGISOPS_<ROLE>_EMAIL` scopes) |
 | Explicit plan + intent token (Phase 5) | **Implemented** (`armoriq/plan.py`; `capture_plan` → `get_intent_token`; honest ready/error/not_configured) |
 | Delegation (Phase 6) | **Implemented** (`armoriq/delegation.py`; live-verified scoped `delegate_subtree()` ×3, key-bound, in-memory tokens, honest delegations/governed) |
 | Governed invocation (Phase 7) | **Implemented** (`invoke_governed`; authority-presence mode selection; rejections surfaced + audited, no fake rules) |
 | Database | **Implemented** (SQLite audit mirror `database/audit.py`; safe metadata only) |
 | Enforcement demonstrations (Phase 8–9) | **Implemented (code + offline tests)** — blocked diagnosis attempt recorded + audited; allowed remediation path. Live verification pending MCP registration with public tunnel URLs (`tests/test_live_authorization.py`, self-skipping) |
-| Demo scripts | **Implemented** (`run_incident.sh` runs one complete incident end to end; `run_enforcement_demo.sh` runs the Phase 8/9 blocked/allowed demonstration) |
+| Security-model hardening + reliability (final pass) | **Implemented** — governed-path defense-in-depth, timeouts + bounded retries, duplicate rejection + state machine, audit indexes, prompt-injection sanitization, hostile-input tests, preflight + static checks (`tests/test_security.py`, 20 tests) |
+| Demo scripts | **Implemented** (`run_incident.sh` runs one complete incident end to end; `run_enforcement_demo.sh` runs the Phase 8/9 blocked/allowed demonstration; `preflight.sh` + `check_security.sh` + `.ps1` wrappers) |
 
 ## Setup
 
@@ -255,16 +265,28 @@ scripts/run_incident.sh     # break -> investigate -> diagnose -> restart -> ver
 # proof and the audit mirror printed):
 scripts/run_enforcement_demo.sh
 
+# Readiness + static security checks:
+scripts/preflight.sh          # human-readable readiness report (venv, keys, identities, infra, MCPs, agents, live enforcement status)
+scripts/check_security.sh     # static scan: event-framing wording, secret leakage, shell-exec, gitignore coverage
+
+# Windows PowerShell wrappers (call the same scripts via Git Bash):
+scripts\preflight.ps1
+scripts\check_security.ps1
+scripts\run_incident.ps1
+scripts\run_enforcement_demo.ps1
+scripts\stop_all.ps1
+
 # Automated verification (from repo root, requires running Docker):
 python -m pytest tests/test_infrastructure.py -v      # 5 tests - infra lifecycle
 python -m pytest tests/test_mcp_spike.py -v           # 4 tests - transport spike
-python -m pytest tests/test_mcp_tools.py -v           # 13 tests - MCPs incl. real restart
-python -m pytest tests/test_agents_unit.py -v         # 31 tests - contracts, LLM validation, fallback
+python -m pytest tests/test_mcp_tools.py -v           # 18 tests - MCPs incl. real restart + hostile-input hardening
+python -m pytest tests/test_agents_unit.py -v         # 34 tests - contracts, LLM validation, fallback, lifecycle
 python -m pytest tests/test_agents_integration.py -v  # 7 tests - real agent processes + MCPs + Docker
-python -m pytest tests/test_phase5.py -v              # 14 tests - identities, plan, intent token
+python -m pytest tests/test_phase5.py -v              # 29 tests - identities, plan, intent token
 python -m pytest tests/test_phase67.py -v             # 20 tests - delegation, governed invoke, audit mirror, Phase 8 probe
+python -m pytest tests/test_security.py -v            # 20 tests - security-model hardening + reliability (offline)
 python -m pytest tests/test_e2e.py -v                 # 1 test - full incident, real restart, RESOLVED
-python -m pytest tests/                               # everything offline (113 tests; 3 live tests self-skip without a real key + registered MCPs)
+python -m pytest tests/                               # everything offline (138 tests; 3 live tests self-skip without a real key + registered MCPs)
 python -m pytest tests/test_live_authorization.py -m live   # LIVE Phase 8/9 proof (real key + registered MCPs + Docker)
 ```
 
