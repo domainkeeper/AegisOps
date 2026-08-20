@@ -102,17 +102,19 @@ flowchart TB
 
 ## 4. Agent Architecture
 
-> **Phase 4 status (2026-08-20):** all four agents are implemented and running as genuinely separate
-> processes WITHOUT ArmorIQ — the **unguarded baseline**. §4.1–§4.4 below document the ArmorIQ-enabled
-> design (future phases); §4.5–§4.9 document what is actually implemented and running now. The two must not
-> be confused: today there are no keypairs, no tokens, no proxy — the agents call the MCPs directly over
-> localhost HTTP, and the Diagnosis Agent's restart attempt succeeds.
+> **Phase 5 status (2026-08-20):** all four agents run as genuinely separate processes WITHOUT ArmorIQ
+> enforcement — the **unguarded baseline**. §4.1–§4.4 below document the ArmorIQ-enabled design (future
+> phases 6–9); §4.5–§4.9 document the unguarded multi-agent system that is actually running now; §4.10
+> documents what Phase 5 added (per-agent identities + explicit plan + intent token). The two must not be
+> confused: today the agents call the MCPs directly over localhost HTTP, and the Diagnosis Agent's restart
+> attempt succeeds. Phase 5 added ArmorIQ *intent* (a captured 4-step plan and an intent token held in
+> memory) but no *enforcement* — `delegate()` and `invoke()` arrive in Phase 6+.
 
-All four agents are **separate Python processes** (`agents/*.py`), started independently, each generating its
-own Ed25519 keypair at startup and holding its own `ArmorIQClient` (its own ArmorIQ identity) **in the
-ArmorIQ phases**; in Phase 4 there is no identity layer yet. Inter-agent
-communication is HTTP: each agent exposes one `/run_task` endpoint; the Commander sends the delegated token +
-task over HTTP. See PLAN.md §5.
+All four agents are **separate Python processes** (`agents/*.py`), started independently. Each owns an
+Ed25519 keypair under `.keys/<role>/` and an email scope (`AEGISOPS_<ROLE>_EMAIL`, default
+`<role>@aegisops.local`) for the one-key + `for_user(email)` ArmorIQ identity model — implemented Phase 5.
+Inter-agent communication is HTTP: each agent exposes one `/run_task` endpoint; the Commander sends the task
+over HTTP. See PLAN.md §5.
 
 ### 4.1 Commander Agent
 
@@ -235,7 +237,7 @@ The complete unguarded workflow (proven by `tests/test_e2e.py` and `scripts/run_
 3. Commander receives the incident.
 4. Commander → Log Agent → `search_logs("auth-api")` → evidence + summary.
 5. Commander → Diagnosis Agent with evidence → `get_service_status` + `inspect_service_state`.
-6. Diagnosis Agent reasons (LLM when `AEGISOPS_LLM_API_KEY` is set; otherwise the explicitly-marked
+6. Diagnosis Agent reasons (Gemini via `AEGISOPS_GEMINI_API_KEY`; otherwise the explicitly-marked
    deterministic test fallback) → `{requires_remediation: true, recommended_action: restart_service}`.
 7. **Unguarded baseline:** the Diagnosis Agent itself calls `restart_service("auth-api")` through
    remediation-mcp → the Docker container really restarts.
@@ -258,6 +260,13 @@ log lines are framed as untrusted data in the system prompt (prompt-injection gu
 deterministic test fallback (`AEGISOPS_LLM_FALLBACK=test`, `llm_source: "fallback"`) is the ONLY no-key path
 and is never presented as model-generated.
 
+**Provider (Phase 5):** the official `google-genai` SDK against `gemini-3.5-flash-lite` (the current stable
+GA Flash-Lite model, verified against ai.google.dev on 2026-08-20; `gemini-3.1-flash-lite` is deprecated in
+its favour). Structured output is requested with `response_json_schema` and re-validated locally by pydantic
+(action + service allowlists still enforced client-side). Credentials: `AEGISOPS_GEMINI_API_KEY`;
+`AEGISOPS_LLM_MODEL` (default `gemini-3.5-flash-lite`); `AEGISOPS_LLM_TIMEOUT` (default 30s). The Phase 4
+OpenAI-compatible wrapper was removed.
+
 ### 4.9 Phase 4 implemented design — unguarded security baseline
 
 **The Diagnosis Agent can currently reach the remediation capability, and the restart succeeds.**
@@ -269,6 +278,43 @@ ArmorIQ Proxy while the Remediation Agent's separately-delegated call succeeds. 
 in-code rule like `if agent == "diagnosis": deny restart` — Phase 4 is pure agent→MCP connectivity so the
 later block can be attributed entirely to the cryptographic authority layer. This unsafe baseline is what
 the unguarded phase exists to reproduce.
+
+### 4.10 Phase 5 implemented design — identities + explicit plan + intent token
+
+Phase 5 adds ArmorIQ *intent* without changing the unguarded execution path:
+
+- **Agent identities** — `armoriq/client_setup.py` provides the per-agent lifecycle. Each role
+  (`commander`, `log_agent`, `diagnosis_agent`, `remediation_agent`) has an Ed25519 keypair under
+  `.keys/<role>/` (generated if missing, never regenerated, gitignored — private keys never logged or
+  serialized) and an email scope `AEGISOPS_<ROLE>_EMAIL` (default `<role>@aegisops.local`). Identity is one
+  API key + per-request `for_user(email)` — the SDK 0.6.10 model (`user_id`/`agent_id` deprecated).
+  `scripts/ensure_identities.py` prints the four public keys and emails.
+- **Explicit execution plan** — `armoriq/plan.py` builds the 4-step plan for every incident
+  (`search_logs` → `get_service_status` → `inspect_service_state` → `restart_service`) and validates it
+  strictly (`PlanValidationError` on malformed plans). The plan is an explicit artifact we control — the SDK
+  never invents it.
+- **Intent-token handshake** — the Commander runs it at the start of every `/incident`
+  (`_capture_intent`): `capture_plan()` (local) then `get_intent_token()` (network). Outcome is recorded on
+  `IncidentResult` as `plan`, `intent_token_status` (`ready` / `error` / `not_configured`),
+  `intent_token_expires_at`, `intent_token_error`. The token object itself is NEVER stored on the context,
+  never serialized into responses, and never logged (it carries `raw_token`/`jwt_token`). A missing
+  `ARMORIQ_API_KEY` is reported honestly as `not_configured` and never blocks the unguarded flow.
+  `scripts/armoriq_plan_token.py` runs the same handshake standalone (prints only non-sensitive metadata).
+- **Deliberately NOT implemented (Phase 6+):** `delegate()`, delegated tokens, `allowed_actions`,
+  `invoke()`-wrapped MCP calls, blocked diagnosis, SQLite audit, proxy flow. Phase 5 ends with the root
+  intent token ready (or a clear config error).
+
+```text
+Incident received
+   │
+   ├─ 1. build explicit 4-step plan (local, armoriq/plan.py)   [always]
+   ├─ 2. validate plan (PlanValidationError → intent_token_status=error) [always]
+   ├─ 3. capture_plan() (local)                                [needs ArmorIQClient]
+   ├─ 4. get_intent_token() (network) → intent_token_status    [needs ARMORIQ_API_KEY]
+   │        ready | error | not_configured  (token held in memory only, never logged)
+   │
+   └─ then the unguarded Phase 4 flow runs exactly as before (Agent → MCP → Docker)
+```
 
 ---
 
@@ -541,6 +587,12 @@ the SDK. Facts below were verified on 2026-08-19 against `docs.armoriq.ai` (curr
 
 ### 8.6 Delegation & authorization design (unchanged)
 
+> **Phase 5 status (2026-08-20):** the design below is the target. Phase 5 implemented the foundation up to
+> and including the root **intent token** (`capture_plan` → `get_intent_token`, see §4.10). `delegate()` and
+> `invoke()` are NOT yet wired in — that is Phase 6+.
+
+The intended flow (unchanged from the original design):
+
 | Concept | Role in AegisOps |
 |---|---|
 | **Agent identities** | Each of the 4 processes runs its own `ArmorIQClient` (own API key usage) and its own Ed25519 keypair. With the one-key/for_user model, per-agent identity is carried by: separate processes + separate keypairs (bound at `delegate()`) + a per-agent email (`commander@aegisops.local`, etc.) passed as `user_email` for audit/policy scoping |
@@ -748,7 +800,7 @@ AegisOps/
 ├── agents/
 │   ├── __init__.py            # package exports (re-exports contracts/helpers)
 │   ├── common.py              # contracts (pydantic), JSON structured logging, MCP + HTTP transport helpers
-│   ├── llm.py                 # OpenAI-compatible LLM wrapper + strict output validation + marked test fallback
+│   ├── llm.py                 # Gemini (google-genai) LLM integration + strict output validation + marked test fallback (Phase 4/5)
 │   ├── commander.py           # Process 1 (port 8094): orchestration, incident context, RESOLVED/FAILED (Phase 4 - implemented)
 │   ├── log_agent.py           # Process 2 (port 8091): search_logs via log-mcp (Phase 4 - implemented)
 │   ├── diagnosis_agent.py     # Process 3 (port 8092): status/state + LLM diagnosis + UNGUARDED restart attempt (Phase 4 - implemented)
@@ -761,7 +813,8 @@ AegisOps/
 │   └── remediation_mcp.py    # remediation-mcp :8083 - restart_service (write, allowlist-scoped)
 ├── armoriq/
 │   ├── __init__.py            # package exports
-│   └── client_setup.py        # env loading, ARMORIQ_API_KEY validation, client factory, Ed25519 keypair helpers
+│   ├── client_setup.py        # env loading, ARMORIQ_API_KEY validation, client factory, per-agent Ed25519 keypair lifecycle + email scopes (Phase 5)
+│   └── plan.py                # explicit 4-step plan: build/validate -> capture_plan -> get_intent_token (Phase 5)
 ├── infrastructure/
 │   ├── auth_api/
 │   │   ├── main.py           # FastAPI app: /health, /break, /fix (in-memory state)
@@ -778,11 +831,14 @@ AegisOps/
 │   ├── test_mcp_tools.py      # Phase 3: all three MCPs, incl. real restart integration (13 tests)
 │   ├── test_agents_unit.py    # Phase 4: contracts, LLM validation, fallback, lifecycle, no-shell (31 tests)
 │   ├── test_agents_integration.py # Phase 4: real processes + real MCPs + real Docker (7 tests)
-│   ├── test_e2e.py            # Phase 4: full incident -> real restart -> RESOLVED (1 test)
+│   ├── test_phase5.py         # Phase 5: identities, plan validation, intent-token states, token never serialized (14 tests)
+│   ├── test_e2e.py            # Phase 4/5: full incident -> real restart -> RESOLVED + plan/intent assertions (1 test)
 │   ├── test_authorization.py  # Phase 8: Security path (blocked) + happy path (allowed) — critical
 │   └── test_e2e_authorized.py # Phase 9/10: full flow with ArmorIQ enforcement
 ├── scripts/
 │   ├── armoriq_smoke_test.py  # SDK smoke test (Phase 1): local checks + optional network checks
+│   ├── ensure_identities.py   # Phase 5: per-agent keypairs + email scopes (public keys only)
+│   ├── armoriq_plan_token.py  # Phase 5: standalone capture_plan -> get_intent_token (needs real key)
 │   ├── spike_probe.py         # Phase 3: client probe for the transport spike (spike must be running)
 │   ├── start_env.sh           # compose up + wait for health
 │   ├── check_health.sh        # curl /health
@@ -843,7 +899,7 @@ The database (`database/`) and authorization tests do not exist yet.
 | 16 | **NEW (Phase 3):** local package named `mcp_servers/`, not `mcp/` | `mcp` is the official SDK's package name — a local `mcp/` directory shadows it | Hit the collision during the spike |
 | 17 | **NEW (Phase 3):** local dev talks to MCPs on localhost directly; ArmorIQ-connected modes = public HTTPS tunnel (deployment concern, no provider hardcoded) OR self-hosted ArmorIQ stack (`use_production=False`); hosted proxy cannot reach localhost | Verified against official docs: registration requires public HTTPS; self-hosting is officially supported | docs.armoriq.ai, 2026-08-19 |
 | 18 | **NEW (Phase 4):** agents are FastAPI/uvicorn processes; agent + MCP URLs env-overridable (`AEGISOPS_*_URL`) | Same framework as the rest of the project; deployable on different hosts later | Phase 4 |
-| 19 | **NEW (Phase 4):** LLM = minimal OpenAI-compatible wrapper (`agents/llm.py`, httpx only) reading `AEGISOPS_LLM_API_KEY/BASE_URL/MODEL` from the environment; NO provider abstraction framework | Smallest practical integration; one provider, swappable via base URL | PLAN §8, Phase 4 |
+| 19 | **NEW (Phase 4/5):** LLM = official `google-genai` SDK against `gemini-3.5-flash-lite` (current stable GA, verified 2026-08-20) reading `AEGISOPS_GEMINI_API_KEY` / `AEGISOPS_LLM_MODEL` from the environment; strict `response_json_schema` + local re-validation; NO provider abstraction framework | Switched from the Phase 4 OpenAI-compatible httpx wrapper per the verified model decision | PLAN §8, Phase 4/5 |
 | 20 | **NEW (Phase 4):** no LLM key + `AEGISOPS_LLM_FALLBACK=test` → explicitly-marked deterministic fallback (`llm_source: "fallback"`); otherwise a clear error, never a fake model diagnosis | Honesty requirement: reproducible demo/tests without credentials without pretending to be LLM-powered | Phase 4 user instruction |
 | 21 | **NEW (Phase 4):** unguarded baseline — the Diagnosis Agent itself performs the restart through remediation-mcp; no `if agent == "diagnosis"` rule anywhere | Phase 4 must reproduce the unsafe behavior so Phases 5–8 can block the exact same path | Phase 4 |
 
@@ -882,8 +938,8 @@ Dependency-aware order from PLAN §13. Each phase is gated on the previous one:
 | 1 | **Project skeleton** — `.gitignore`, `.env.example`, deps, compose skeleton, API key working — **DONE (2026-08-19)**: env on Python 3.12, SDK verified + installed (0.6.10), client/identity foundation (`armoriq/client_setup.py`), smoke test (`scripts/armoriq_smoke_test.py`, local path passes) | Foundation; everything else depends on it |
 | 2 | **Docker infrastructure** — `auth-api` with `/health` `/break` `/fix`; manual break/restart/heal — **DONE (2026-08-19)**: FastAPI service + Dockerfile + root compose + 6 dev scripts; break → 503, real `docker restart auth-api` → healthy (start-time proven); 5/5 tests pass (§9) | MCPs need a real target; proves the real-world effect first |
 | 3 | **MCP tools** — `log_mcp.py`, `diagnostic_mcp.py`, `remediation_mcp.py` speaking **JSON-RPC 2.0 + SSE** (`initialize`/`tools/list`/`tools/call`), registered on the platform under exact names; resolve local-MCP connectivity first (§8.3) — **DONE (2026-08-19)**: official MCP SDK v2 (mcp==2.0.0), Streamable HTTP; connectivity resolved (§7.2: local = direct localhost, ArmorIQ = tunnel or self-hosted proxy); spike verified; 3 servers + 4 tools; 17/17 MCP tests pass incl. real restart | Agents need tools; tools need infra (Phase 2) and registration |
-| 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) — **DONE (2026-08-20)**: `agents/` (commander :8094, log-agent :8091, diagnosis-agent :8092, remediation-agent :8093), pydantic contracts, OpenAI-compatible LLM wrapper + validated schema + marked test fallback, real restart via the diagnosis agent's unguarded attempt, idempotent remediation agent; 39 agent tests pass (31 unit + 7 integration + 1 E2E) plus `scripts/run_incident.sh` runs one incident end to end (§4.5–§4.9) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
-| 5 | **ArmorIQ identities + plan** — per-agent keypairs; `capture_plan()` → `get_intent_token()` | The authorization layer's foundation |
+| 4 | **Agent processes, unguarded** — 4 processes + HTTP transport + LLM diagnosis, calling MCPs directly (no ArmorIQ) — **DONE (2026-08-20)**: `agents/` (commander :8094, log-agent :8091, diagnosis-agent :8092, remediation-agent :8093), pydantic contracts, Gemini LLM + validated schema + marked test fallback, real restart via the diagnosis agent's unguarded attempt, idempotent remediation agent; 39 agent tests pass (31 unit + 7 integration + 1 E2E) plus `scripts/run_incident.sh` runs one incident end to end (§4.5–§4.9) | Safety net (PLAN §20 fallback); validates the scenario end-to-end before adding crypto |
+| 5 | **ArmorIQ identities + plan** — per-agent keypairs + email scopes; explicit 4-step plan; `capture_plan()` → `get_intent_token()` — **DONE (2026-08-20)**: `.keys/<role>/` per-agent Ed25519 keypairs, `AEGISOPS_<ROLE>_EMAIL` scopes, `armoriq/plan.py` (build/validate/capture/token), Commander `_capture_intent` on `/incident` with honest `ready`/`error`/`not_configured` states and the token never stored/logged/serialized; `scripts/ensure_identities.py` + `scripts/armoriq_plan_token.py`; `tests/test_phase5.py`; full suite 93 tests pass | The authorization layer's foundation |
 | 6 | **ArmorIQ delegation** — `delegate()` ×3 with correct `allowed_actions` | Tokens are the currency of Phase 7 |
 | 7 | **Wire `invoke()` into every MCP call** — replace direct HTTP calls | The scenario now runs through ArmorIQ |
 | 8 | **The violation + enforcement** — Diagnosis Agent's blocked `restart_service`; audit row | The demo's centerpiece; depends on 5-7 |

@@ -24,8 +24,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Keep the suite deterministic: tests never hit a real LLM endpoint unless a
 # specific test explicitly injects credentials via monkeypatch.
-os.environ["AEGISOPS_LLM_API_KEY"] = ""
+os.environ["AEGISOPS_GEMINI_API_KEY"] = ""
 os.environ["AEGISOPS_LLM_FALLBACK"] = "test"
+
+# Keep the ArmorIQ intent-token handshake offline/hermetic: the Commander
+# records intent_token_status="not_configured" unless a test injects a key.
+os.environ["ARMORIQ_API_KEY"] = ""
 
 PROCESSES: list[subprocess.Popen] = []
 

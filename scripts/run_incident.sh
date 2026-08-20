@@ -1,10 +1,12 @@
 #!/usr/bin/env sh
 # Run one complete incident end to end with the real (unguarded) multi-agent
 # system: break auth-api -> Log Agent investigates -> Diagnosis Agent reasons
-# (LLM if AEGISOPS_LLM_API_KEY is set, otherwise the explicitly-marked
+# (Gemini if AEGISOPS_GEMINI_API_KEY is set, otherwise the explicitly-marked
 # deterministic test fallback) -> Remediation Agent restarts via MCP ->
 # the Docker container restarts for real -> auth-api recovers -> Commander
-# marks the incident RESOLVED.
+# marks the incident RESOLVED. The Commander also builds and captures the
+# explicit 4-step plan (Phase 5 intent handshake; needs ARMORIQ_API_KEY for a
+# real intent token, otherwise reported as not_configured - never faked).
 #
 # Usage:
 #   scripts/run_incident.sh [incident_id]
@@ -18,12 +20,12 @@ PYTHON=.venv/Scripts/python.exe
 
 echo "== AegisOps unguarded incident run: $INCIDENT_ID =="
 
-if [ -z "${AEGISOPS_LLM_API_KEY:-}" ]; then
+if [ -z "${AEGISOPS_GEMINI_API_KEY:-}" ]; then
   export AEGISOPS_LLM_FALLBACK=test
-  echo "NOTE: no AEGISOPS_LLM_API_KEY set - the Diagnosis Agent will use the"
+  echo "NOTE: no AEGISOPS_GEMINI_API_KEY set - the Diagnosis Agent will use the"
   echo "      explicitly-marked deterministic TEST fallback (diagnosis is NOT"
-  echo "      model-generated). Set AEGISOPS_LLM_API_KEY for real LLM diagnosis."
-  echo "      Restarting agents so they pick up the fallback setting..."
+  echo "      model-generated). Set AEGISOPS_GEMINI_API_KEY for real Gemini"
+  echo "      diagnosis. Restarting agents so they pick up the fallback setting..."
   scripts/stop_agents.sh >/dev/null 2>&1 || true
 fi
 
@@ -54,7 +56,7 @@ response=$(curl -fsS -X POST http://127.0.0.1:8094/incident \
   -d "{\"incident_id\":\"$INCIDENT_ID\",\"service\":\"auth-api\",\"severity\":\"high\",\"description\":\"auth-api unhealthy\"}")
 
 echo "[5/6] Incident result:"
-echo "$response" | "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print('  status        :', d['status']); print('  incident_id   :', d['incident_id']); print('  evidence items:', len((d.get('investigation') or {}).get('evidence', []))); diag=d.get('diagnosis') or {}; print('  diagnosis     :', diag.get('diagnosis','')); print('  llm_source    :', diag.get('llm_source')); rem=d.get('remediation') or {}; print('  remediation   :', (('noop=' + str(rem.get('noop')) + ' success=' + str(rem.get('success'))) if rem.get('noop') is not None else 'none needed'), (rem.get('started_at') or '')); print('  verification  :', (d.get('verification') or {}).get('status')); print('  error         :', d.get('error'))" 2>/dev/null \
+echo "$response" | "$PYTHON" -c "import json,sys; d=json.load(sys.stdin); print('  status        :', d['status']); print('  incident_id   :', d['incident_id']); print('  evidence items:', len((d.get('investigation') or {}).get('evidence', []))); diag=d.get('diagnosis') or {}; print('  diagnosis     :', diag.get('diagnosis','')); print('  llm_source    :', diag.get('llm_source')); rem=d.get('remediation') or {}; print('  remediation   :', (('noop=' + str(rem.get('noop')) + ' success=' + str(rem.get('success'))) if rem.get('noop') is not None else 'none needed'), (rem.get('started_at') or '')); print('  verification  :', (d.get('verification') or {}).get('status')); plan=d.get('plan') or {}; print('  plan          :', str(len(plan.get('steps', []))) + ' steps captured (' + ', '.join(s.get('action','') for s in plan.get('steps', [])) + ')'); ts=d.get('intent_token_status'); print('  intent token  :', ts, (d.get('intent_token_expires_at') or ('(' + (d.get('intent_token_error') or '') + ')' if ts != 'ready' else ''))); print('  error         :', d.get('error'))" 2>/dev/null \
   || echo "$response" | sed 's/^/  /'
 
 case "$response" in

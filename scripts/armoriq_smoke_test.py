@@ -39,16 +39,6 @@ from armoriq.client_setup import (  # noqa: E402
     public_key_hex,
 )
 
-AEGIS_PLAN = {
-    "goal": "Diagnose and restart auth-api if unhealthy",
-    "steps": [
-        {"action": "search_logs",        "mcp": "log-mcp",        "params": {"service": "auth-api"}},
-        {"action": "get_service_status", "mcp": "diagnostic-mcp", "params": {"service": "auth-api"}},
-        {"action": "inspect_service_state",     "mcp": "diagnostic-mcp", "params": {"service": "auth-api"}},
-        {"action": "restart_service",    "mcp": "remediation-mcp", "params": {"service": "auth-api"}},
-    ],
-}
-
 
 class Checker:
     def __init__(self) -> None:
@@ -81,7 +71,7 @@ def run(checks: Checker, local_only: bool) -> None:
         checks.exit_code = 2
         return
 
-    # 2. Client initialization ----------------------------------------------
+# 2. Client initialization ----------------------------------------------
     print("[2/4] client")
     try:
         client = get_client()
@@ -91,19 +81,22 @@ def run(checks: Checker, local_only: bool) -> None:
         return
 
     # 3. capture_plan (local) ------------------------------------------------
+    # Uses the Phase 5 plan module so this smoke test exercises the same
+    # explicit 4-step plan the Commander builds for every incident.
+    import types as _types
+
+    from armoriq.plan import PLAN_LLM_LABEL, capture_execution_plan
+
+    fake_incident = _types.SimpleNamespace(incident_id="smoke", service="auth-api")
     try:
-        plan = client.capture_plan(
-            llm="claude-3",
-            prompt="Investigate and remediate an unhealthy auth-api service",
-            plan=AEGIS_PLAN,
-        )
+        plan = capture_execution_plan(client, fake_incident)
         n = len(plan.plan["steps"])
         assert n == 4, f"expected 4 steps, got {n}"
         actions = [s["action"] for s in plan.plan["steps"]]
         assert "restart_service" in actions
         checks.ok(
             "capture_plan() accepted the 4-step AegisOps plan",
-            f"goal='{plan.plan['goal']}', steps={actions}",
+            f"llm={PLAN_LLM_LABEL}, goal='{plan.plan['goal']}', steps={actions}",
         )
         # plan_hash / merkle_root are computed server-side at get_intent_token()
         # in armoriq-sdk 0.6.10 (not exposed on PlanCapture).

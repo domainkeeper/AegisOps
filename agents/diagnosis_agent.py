@@ -55,11 +55,11 @@ async def _produce_diagnosis(
         return await llm.generate_diagnosis(service, evidence, status, state, incident_id), "llm"
     if llm.test_fallback_enabled():
         log_event(logger, incident_id, "llm_unavailable", "fallback",
-                  reason="no AEGISOPS_LLM_API_KEY set; AEGISOPS_LLM_FALLBACK=test "
+                  reason="no AEGISOPS_GEMINI_API_KEY set; AEGISOPS_LLM_FALLBACK=test "
                          "selects the deterministic TEST fallback (NOT model-generated)")
         return llm.fallback_diagnosis(service, evidence, status, state, incident_id), "fallback"
     raise AgentError(
-        "no LLM configured (AEGISOPS_LLM_API_KEY) and AEGISOPS_LLM_FALLBACK is not 'test'; "
+        "no LLM configured (AEGISOPS_GEMINI_API_KEY) and AEGISOPS_LLM_FALLBACK is not 'test'; "
         "cannot produce a diagnosis"
     )
 

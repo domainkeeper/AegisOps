@@ -65,6 +65,10 @@ class IncidentContext:
         self.diagnosis: DiagnosisResult | None = None
         self.remediation: RemediationResult | None = None
         self.verification: dict | None = None
+        self.plan: dict | None = None
+        self.intent_token_status: str = "not_configured"
+        self.intent_token_expires_at: str | None = None
+        self.intent_token_error: str | None = None
         self.error: str | None = None
 
     def stage(self, name: str, status: str, detail: str = "") -> None:
@@ -80,9 +84,67 @@ def _to_error_result(ctx: IncidentContext) -> IncidentResult:
         diagnosis=ctx.diagnosis,
         remediation=ctx.remediation,
         verification=ctx.verification,
+        plan=ctx.plan,
+        intent_token_status=ctx.intent_token_status,
+        intent_token_expires_at=ctx.intent_token_expires_at,
+        intent_token_error=ctx.intent_token_error,
         timeline=ctx.timeline,
         error=ctx.error,
     )
+
+
+def _capture_intent(ctx: IncidentContext) -> None:
+    """Phase 5 intent handshake: explicit plan -> ArmorIQ capture -> intent token.
+
+    Best-effort and NON-BLOCKING for the unguarded orchestration: any failure
+    sets intent_token_status="error"/"not_configured" with a clear message but
+    never aborts the incident. The token object itself is never retained or
+    logged (it carries raw_token/jwt_token); only its status/expiry are kept.
+    """
+    from armoriq import plan as plan_mod  # lazy: keeps agent startup armoriq-free
+
+    ctx.plan = plan_mod.build_incident_plan(ctx.incident)
+    try:
+        plan_mod.plan_ok_for_capture(ctx.plan)
+    except plan_mod.PlanValidationError as exc:
+        ctx.intent_token_status = "error"
+        ctx.intent_token_error = f"plan validation failed: {exc}"
+        ctx.stage("intent_capture", "error", detail=ctx.intent_token_error)
+        log_event(logger, ctx.incident.incident_id, "intent_capture", "error",
+                  error=ctx.intent_token_error)
+        return
+
+    if not plan_mod.armoriq_configured():
+        ctx.intent_token_status = "not_configured"
+        ctx.intent_token_error = (
+            "ARMORIQ_API_KEY is not set; plan captured locally only (no intent token). "
+            "See .env.example and README 'ACTION REQUIRED'."
+        )
+        ctx.stage("intent_capture", "not_configured", detail=ctx.intent_token_error)
+        log_event(logger, ctx.incident.incident_id, "intent_capture", "not_configured")
+        return
+
+    try:
+        from armoriq.client_setup import get_client
+
+        client = get_client()
+        plan_capture = plan_mod.capture_execution_plan(client, ctx.incident)
+        token = plan_mod.generate_intent_token(client, plan_capture)
+    except Exception as exc:
+        ctx.intent_token_status = "error"
+        ctx.intent_token_error = f"intent token handshake failed: {exc}"
+        ctx.stage("intent_capture", "error", detail=ctx.intent_token_error)
+        log_event(logger, ctx.incident.incident_id, "intent_capture", "error",
+                  error=ctx.intent_token_error)
+        return
+
+    # Keep only non-sensitive state. The token is never stored on the context.
+    ctx.intent_token_status = "ready"
+    ctx.intent_token_expires_at = getattr(token, "expires_at", None) or ""
+    ctx.stage("intent_capture", "ready",
+              detail=f"intent token ready, expires_at={ctx.intent_token_expires_at}")
+    log_event(logger, ctx.incident.incident_id, "intent_capture", "ready",
+              expires_at=ctx.intent_token_expires_at)
 
 
 def _validate_result(model, payload: dict, label: str) -> None:
@@ -105,6 +167,9 @@ async def handle_incident(incident: Incident) -> IncidentResult:
               service=incident.service, severity=incident.severity,
               description=incident.description)
     ctx.stage("incident_received", "ok")
+
+    # Phase 5 intent handshake (best-effort, never blocks orchestration).
+    _capture_intent(ctx)
 
     try:
         # 3. Log Agent: gather evidence

@@ -68,21 +68,28 @@ The ArmorIQ enforcement phases will convert exactly that path into the blocked d
 
 Agent → MCP → Docker. No agent ever runs `docker` directly; there is no shell tool anywhere.
 
-**LLM (Diagnosis Agent only):** an OpenAI-compatible wrapper (`agents/llm.py`) — `AEGISOPS_LLM_API_KEY`,
-`AEGISOPS_LLM_BASE_URL`, `AEGISOPS_LLM_MODEL` (default `gpt-4o-mini`). The model interprets evidence and
-returns a strict JSON diagnosis which is validated against a schema + an action allowlist
-(`none` / `restart_service` only). The model never executes anything. With no key configured, the agent
-fails clearly — or uses the **explicitly-marked deterministic TEST fallback** when `AEGISOPS_LLM_FALLBACK=test`
-is set (always labelled `llm_source: "fallback"`, never presented as model-generated).
+**LLM (Diagnosis Agent only):** the official `google-genai` SDK (`agents/llm.py`) against
+`gemini-3.5-flash-lite` (the current stable GA Flash-Lite model, verified against the official Gemini API
+docs) — configured with `AEGISOPS_GEMINI_API_KEY` and `AEGISOPS_LLM_MODEL`. The model interprets evidence and
+returns a strict JSON diagnosis (requested via `response_json_schema`) which is re-validated against a schema
++ an action allowlist (`none` / `restart_service` only). The model never executes anything. With no key
+configured, the agent fails clearly — or uses the **explicitly-marked deterministic TEST fallback** when
+`AEGISOPS_LLM_FALLBACK=test` is set (always labelled `llm_source: "fallback"`, never presented as
+model-generated).
 
 ## ArmorIQ's Role
 
-ArmorIQ is the source of truth for authorization:
+ArmorIQ is the source of truth for authorization. Phase 5 implements the intent layer; Phase 6+ adds the
+enforcement layer:
 
-- `capture_plan()` — Commander captures the explicit incident plan (goal + steps)
-- `get_intent_token()` — plan is canonicalized, hashed, Merkle-proved, and signed
-- `delegate()` — Commander mints scoped, time-limited tokens bound to each child agent's public key
-- `invoke()` — every tool call is verified at the ArmorIQ Proxy; out-of-scope calls are **blocked**
+- `capture_plan()` — **implemented (Phase 5):** Commander captures the explicit 4-step incident plan
+  (goal + steps) — local
+- `get_intent_token()` — **implemented (Phase 5):** plan is canonicalized, hashed, Merkle-proved, and signed;
+  the token is held in memory as readiness state, never logged or returned
+- `delegate()` — **Planned (Phase 6):** Commander mints scoped, time-limited tokens bound to each child
+  agent's public key
+- `invoke()` — **Planned (Phase 7):** every tool call is verified at the ArmorIQ Proxy; out-of-scope calls
+  are **blocked**
 
 ## Core Security Concept
 
@@ -96,7 +103,8 @@ plan proof, never on the text of the request and never on what an LLM intends.
 ## Incident Scenario (current, unguarded)
 
 1. `auth-api` container is broken (`POST /break`) — `/health` → 503
-2. The incident is submitted to the Commander (`POST /incident`)
+2. The incident is submitted to the Commander (`POST /incident`) — it builds the explicit 4-step plan and
+   captures it with ArmorIQ (`capture_plan` → `get_intent_token`; honest `not_configured` without a key)
 3. Commander asks the Log Agent to investigate → log evidence
 4. Commander sends the evidence to the Diagnosis Agent → service state + LLM/fallback reasoning
 5. Diagnosis concludes a restart is needed — and (unguarded baseline) **attempts `restart_service("auth-api")` itself** → succeeds
@@ -132,9 +140,14 @@ ArmorIQ phases the Diagnosis Agent's restart attempt will be **blocked** (its de
   `restart_service("auth-api")` tool performs a real Docker restart (start time changes, health recovers).
   ArmorIQ connectivity resolved (see ARCHITECTURE.md §7.2).
 - **Unguarded multi-agent system built and verified** — four independent agent processes orchestrate the
-  complete incident flow over HTTP; the Diagnosis Agent reasons (LLM or marked fallback) and performs the
+  complete incident flow over HTTP; the Diagnosis Agent reasons (Gemini or marked fallback) and performs the
   unguarded restart; the container really restarts and the incident reaches RESOLVED. 39 agent tests pass.
-- **ArmorIQ enforcement not implemented yet** — that is the next phase.
+- **Identities + plan + intent token built (Phase 5)** — per-agent Ed25519 keypairs (`.keys/<role>/`,
+  gitignored) + email scopes; explicit 4-step plan (`armoriq/plan.py`); Commander `capture_plan()` →
+  `get_intent_token()` on every incident with the token never stored/logged/serialized; standalone
+  `scripts/ensure_identities.py` and `scripts/armoriq_plan_token.py`; `tests/test_phase5.py`. The LLM
+  switched to the verified `gemini-3.5-flash-lite` via `google-genai`.
+- **ArmorIQ enforcement not implemented yet** — `delegate()` + `invoke()` + the blocked path are Phase 6+.
 
 ## Current Status
 
@@ -148,8 +161,10 @@ ArmorIQ phases the Diagnosis Agent's restart attempt will be **blocked** (its de
 | Docker infrastructure (`auth-api` + compose + scripts) | **Implemented** (`docker-compose.yml`, `infrastructure/auth_api/`, `scripts/`) |
 | Infrastructure tests | **Implemented** (5 tests, all passing — health / break / real restart) |
 | MCP tools | **Implemented** (3 servers, 4 tools; 22 tests passing incl. real restart) |
-| Multi-agent orchestration (unguarded) | **Implemented** (4 processes, HTTP contracts, LLM diagnosis, real restart; 39 tests incl. full E2E) |
-| ArmorIQ plan/delegate/invoke wiring | **Planned** |
+| Multi-agent orchestration (unguarded) | **Implemented** (4 processes, HTTP contracts, Gemini diagnosis, real restart; 39 tests incl. full E2E) |
+| Agent identities (Phase 5) | **Implemented** (`.keys/<role>/` Ed25519 keypairs + `AEGISOPS_<ROLE>_EMAIL` scopes) |
+| Explicit plan + intent token (Phase 5) | **Implemented** (`armoriq/plan.py`; `capture_plan` → `get_intent_token`; honest ready/error/not_configured) |
+| ArmorIQ delegate/invoke wiring | **Planned** (Phase 6–7) |
 | Database | **Planned** |
 | Demo scripts | **Implemented** (`run_incident.sh` runs one complete incident end to end) |
 
@@ -164,6 +179,7 @@ pip install -r requirements.txt
 # Configure
 copy .env.example .env            # Windows
 # then set ARMORIQ_API_KEY=ak_... (or run `armoriq login`)
+# and AEGISOPS_GEMINI_API_KEY=... for real Gemini diagnoses
 ```
 
 ## Local Development (Docker)
@@ -189,9 +205,13 @@ scripts/stop_mcps.sh        # stop the MCP servers
 # Agents (requires MCPs; runs on 8091/8092/8093/8094)
 scripts/start_agents.sh     # start log-agent, diagnosis-agent, remediation-agent, commander
 scripts/stop_agents.sh      # stop them
-# Set AEGISOPS_LLM_API_KEY first for real LLM diagnosis; without it the
+# Set AEGISOPS_GEMINI_API_KEY first for real Gemini diagnosis; without it the
 # Diagnosis Agent uses the explicitly-marked test fallback (set
 # AEGISOPS_LLM_FALLBACK=test) or fails clearly.
+
+# Phase 5 - agent identities + intent handshake:
+scripts/ensure_identities.sh  # (or) python scripts/ensure_identities.py
+python scripts/armoriq_plan_token.py --incident-id demo-1 --service auth-api
 
 # Run one complete incident end to end (no manual steps):
 scripts/run_incident.sh     # break -> investigate -> diagnose -> restart -> verify -> RESOLVED
@@ -202,8 +222,9 @@ python -m pytest tests/test_mcp_spike.py -v           # 4 tests - transport spik
 python -m pytest tests/test_mcp_tools.py -v           # 13 tests - MCPs incl. real restart
 python -m pytest tests/test_agents_unit.py -v         # 31 tests - contracts, LLM validation, fallback
 python -m pytest tests/test_agents_integration.py -v  # 7 tests - real agent processes + MCPs + Docker
+python -m pytest tests/test_phase5.py -v              # 14 tests - identities, plan, intent token
 python -m pytest tests/test_e2e.py -v                 # 1 test - full incident, real restart, RESOLVED
-python -m pytest tests/                               # everything (61 tests)
+python -m pytest tests/                               # everything (93 tests)
 ```
 
 ## Demo
@@ -214,9 +235,10 @@ scripts/run_incident.sh
 
 One command, zero manual steps: it ensures infrastructure + MCPs + agents are up, breaks `auth-api`, waits
 until `/health` reports unhealthy, submits the incident, and prints the final result (RESOLVED) with the
-evidence count, diagnosis text, LLM source, and verification. The auth-api Docker container genuinely
-restarts in the middle of the flow. No LLM key is required — with `AEGISOPS_LLM_API_KEY` unset it prints a
-notice and uses the explicitly-marked deterministic test fallback for the diagnosis.
+evidence count, diagnosis text, LLM source, the captured 4-step plan, the intent-token status, and the
+verification. The auth-api Docker container genuinely restarts in the middle of the flow. No LLM key is
+required — with `AEGISOPS_GEMINI_API_KEY` unset it prints a notice and uses the explicitly-marked
+deterministic test fallback for the diagnosis.
 
 ---
 

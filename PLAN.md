@@ -233,6 +233,7 @@ What stays in ArmorIQ vs. local storage: ArmorIQ's platform is the **source of t
 **LLM-backed (small, targeted calls):**
 - Diagnosis Agent: given log excerpts + status/config output, decide "does this look like it needs a restart" and produce a short natural-language rationale (this is the "genuinely useful multi-agent" reasoning piece).
 - Phase 4 implementation note (2026-08-20): implemented as a minimal OpenAI-compatible wrapper (`agents/llm.py`; env credentials `AEGISOPS_LLM_API_KEY` / `AEGISOPS_LLM_BASE_URL` / `AEGISOPS_LLM_MODEL`; strict JSON output schema; action + service allowlists). No provider abstraction framework. See ARCHITECTURE.md §4.8.
+- **Phase 5 correction (2026-08-20):** switched to the official `google-genai` SDK against **`gemini-3.5-flash-lite`** (verified current stable GA model, ai.google.dev 2026-08-20; `gemini-3.1-flash-lite` deprecated in its favour). Env: `AEGISOPS_GEMINI_API_KEY` (required for real calls), `AEGISOPS_LLM_MODEL` (default `gemini-3.5-flash-lite`), `AEGISOPS_LLM_TIMEOUT`. Structured output via `response_json_schema` + local pydantic re-validation (allowlists unchanged). The OpenAI-compatible wrapper was removed; the marked deterministic TEST fallback is unchanged.
 - Optionally, Commander: given the incident description, decide which sub-agents to invoke first (can be hardcoded for the single demo scenario if time is short — this is a safe cut).
 
 **Deterministic (no LLM):**
@@ -349,13 +350,14 @@ Skip if behind: combine all three into one process with three routes if MCP sepa
 ### Phase 4 — Agents, unguarded (90 min)
 Tasks: build Commander/Log/Diagnosis/Remediation as separate processes calling MCP tools directly (no ArmorIQ yet), communicating over simple HTTP endpoints; Diagnosis Agent's LLM call to decide "restart needed."
 Done when: end-to-end flow works without any authorization layer — incident → logs → diagnosis → (unchecked) restart → recovery.
-Status: **DONE (2026-08-20)** — `agents/` (commander :8094, log-agent :8091, diagnosis-agent :8092, remediation-agent :8093), pydantic contracts, OpenAI-compatible LLM wrapper + strict output validation + explicitly-marked deterministic TEST fallback (`AEGISOPS_LLM_FALLBACK=test`, `llm_source:"fallback"`; no key + no flag = clear error, never a fake diagnosis), unguarded restart through remediation-mcp, idempotent remediation agent, `scripts/{start_agents,stop_agents,run_incident}.sh`, 39 agent tests (31 unit + 7 integration + 1 E2E); full suite 61 tests pass.
+Status: **DONE (2026-08-20)** — `agents/` (commander :8094, log-agent :8091, diagnosis-agent :8092, remediation-agent :8093), pydantic contracts, LLM wrapper + strict output validation + explicitly-marked deterministic TEST fallback (`AEGISOPS_LLM_FALLBACK=test`, `llm_source:"fallback"`; no key + no flag = clear error, never a fake diagnosis), unguarded restart through remediation-mcp, idempotent remediation agent, `scripts/{start_agents,stop_agents,run_incident}.sh`, 39 agent tests (31 unit + 7 integration + 1 E2E); full suite 61 tests pass. *(LLM provider since Phase 5: Gemini `gemini-3.5-flash-lite` via `google-genai` — see §8.)*
 Skip if behind: hardcode Commander's task dispatch order instead of making it dynamic.
 
 ### Phase 5 — ArmorIQ: identities + plan (60 min)
 Tasks: each agent generates its Ed25519 keypair on startup; Commander builds the explicit 4-step plan and calls `capture_plan()` → `get_intent_token()`.
 Done when: `commander_token` printed/logged successfully with a real `plan_hash`.
 Skip if behind: none — this is core to the system.
+Status: **DONE (2026-08-20)** — per-agent Ed25519 keypairs under `.keys/<role>/` + per-agent email scopes (`AEGISOPS_<ROLE>_EMAIL`, default `<role>@aegisops.local`) via `armoriq/client_setup.py` (`ensure_keypair`/`agent_email`; gitignored, never logged); explicit 4-step plan + strict validation + `capture_plan` → `get_intent_token` in new `armoriq/plan.py`; Commander runs the handshake best-effort on every `/incident` (`_capture_intent`) and records `plan` / `intent_token_status` (`ready`/`error`/`not_configured`) / `intent_token_expires_at` / `intent_token_error` on `IncidentResult` — the token itself is never stored, serialized, or logged; missing key → honest `not_configured`, never blocks the unguarded flow; `scripts/{ensure_identities.sh,armoriq_plan_token.py}`; `tests/test_phase5.py` (14 tests); full suite 93 tests pass. Deliberately NOT done here: `delegate()`, `invoke()`, enforcement (Phase 6+).
 
 ### Phase 6 — ArmorIQ: delegation (60 min)
 Tasks: Commander calls `delegate()` for Log Agent, Diagnosis Agent (restricted `allowed_actions`), and (later, after diagnosis) Remediation Agent; delegated tokens passed to sub-agents over HTTP.

@@ -97,6 +97,19 @@ def test_full_incident_flow_resolves_with_real_restart(agents_layer):
     assert result["verification"]["http_code"] == 200
     assert result["verification"]["status"] == "healthy"
 
+    # Phase 5 intent handshake: the Commander built and captured the explicit
+    # 4-step plan locally. With no ARMORIQ_API_KEY in tests the token step is
+    # honestly reported as not_configured - never faked, never blocking.
+    plan = result["plan"]
+    assert plan is not None
+    assert [s["action"] for s in plan["steps"]] == [
+        "search_logs", "get_service_status", "inspect_service_state", "restart_service",
+    ]
+    assert all(s["mcp"] for s in plan["steps"])
+    assert result["intent_token_status"] == "not_configured"
+    assert result["intent_token_error"] and "ARMORIQ_API_KEY" in result["intent_token_error"]
+    assert result["intent_token_expires_at"] is None
+
     # The Docker container genuinely restarted (start time changed) and is healthy
     started_after = container_started_at()
     assert started_after == diag["remediation_result"]["started_at"], "reported restart must match docker"

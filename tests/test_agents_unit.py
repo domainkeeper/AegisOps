@@ -133,10 +133,66 @@ def test_llm_parse_rejects_schema_violation():
 
 
 def test_llm_failure_is_clear_when_configured_but_unreachable(monkeypatch):
-    monkeypatch.setenv("AEGISOPS_LLM_API_KEY", "sk-test")
-    monkeypatch.setenv("AEGISOPS_LLM_BASE_URL", "http://127.0.0.1:1")  # nothing listens here
+    monkeypatch.setenv("AEGISOPS_GEMINI_API_KEY", "gemini-test")
+
+    class _BoomClient:
+        def generate_content(self, *args, **kwargs):
+            raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(llm, "_get_client", lambda: _BoomClient())
     with pytest.raises(llm.LLMUnavailableError):
         llm.generate_diagnosis("auth-api", [], {"http_code": 503}, {})
+
+
+def test_llm_failure_is_clear_on_invalid_model_output(monkeypatch):
+    monkeypatch.setenv("AEGISOPS_GEMINI_API_KEY", "gemini-test")
+
+    class _StubResponse:
+        text = "not json at all"
+
+    class _StubClient:
+        def generate_content(self, *args, **kwargs):
+            return _StubResponse()
+
+    monkeypatch.setattr(llm, "_get_client", lambda: _StubClient())
+    with pytest.raises(llm.LLMUnavailableError):
+        llm.generate_diagnosis("auth-api", [], {"http_code": 503}, {})
+
+
+def test_llm_success_uses_gemini_model_and_validates_output(monkeypatch):
+    monkeypatch.setenv("AEGISOPS_GEMINI_API_KEY", "gemini-test")
+    seen = {}
+
+    class _StubResponse:
+        text = json.dumps(_valid_output())
+
+    class _StubClient:
+        class _Models:
+            def generate_content(self, model, contents, config, timeout=None):
+                seen["model"] = model
+                seen["config"] = config
+                return _StubResponse()
+
+        models = _Models()
+
+    monkeypatch.setattr(llm, "_get_client", lambda: _StubClient())
+    out = llm.generate_diagnosis("auth-api", [], {"http_code": 503}, {})
+    assert out.recommended_action == "restart_service"
+    assert seen["model"] == llm.DEFAULT_MODEL
+    assert seen["config"].response_mime_type == "application/json"
+
+
+def test_llm_unreachable_error_mentions_model(monkeypatch):
+    monkeypatch.setenv("AEGISOPS_GEMINI_API_KEY", "gemini-test")
+
+    class _BoomClient:
+        def generate_content(self, *args, **kwargs):
+            raise RuntimeError("nope")
+
+    monkeypatch.setattr(llm, "_get_client", lambda: _BoomClient())
+    with pytest.raises(llm.LLMUnavailableError) as exc_info:
+        llm.generate_diagnosis("auth-api", [], {}, {})
+    assert llm.DEFAULT_MODEL in str(exc_info.value)
 
 
 def test_fallback_enabled_gate(monkeypatch):
@@ -147,9 +203,9 @@ def test_fallback_enabled_gate(monkeypatch):
 
 
 def test_configured_requires_key(monkeypatch):
-    monkeypatch.setenv("AEGISOPS_LLM_API_KEY", "sk-real")
+    monkeypatch.setenv("AEGISOPS_GEMINI_API_KEY", "gemini-real")
     assert llm.configured() is True
-    monkeypatch.delenv("AEGISOPS_LLM_API_KEY")
+    monkeypatch.delenv("AEGISOPS_GEMINI_API_KEY")
     assert llm.configured() is False
 
 

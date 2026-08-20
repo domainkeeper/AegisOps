@@ -173,6 +173,13 @@ class IncidentResult(BaseModel):
     diagnosis: DiagnosisResult | None = None
     remediation: RemediationResult | None = None
     verification: dict[str, Any] | None = None
+    # Phase 5 (intent, not enforcement): the explicit execution plan the
+    # Commander captured with ArmorIQ, plus the status of the intent-token
+    # handshake. The token itself is NEVER included here or logged.
+    plan: dict[str, Any] | None = None
+    intent_token_status: str = "not_configured"  # ready | error | not_configured
+    intent_token_expires_at: str | None = None
+    intent_token_error: str | None = None
     timeline: list[TimelineEvent] = []
     error: str | None = None
 
