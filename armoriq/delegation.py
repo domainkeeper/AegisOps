@@ -1,20 +1,26 @@
-"""ArmorIQ delegation - the explicit authority model (Phase 6).
+"""ArmorIQ delegation - the explicit authority model (Phase 6, live-verified 2026-08-20).
 
-Verified against installed armoriq-sdk 0.6.10 (source-inspected 2026-08-20) and
-the official docs (docs.armoriq.ai/sdk/core-methods/delegate):
-
-    delegate(intent_token, delegate_public_key, validity_seconds=3600,
-             allowed_actions=None, target_agent=None, subtask=None)
-             -> DelegationResult
-    DelegationResult fields: delegation_id, delegated_token (IntentToken),
-    delegate_public_key, target_agent, expires_at, trust_delta, status, metadata
+VERIFIED LIVE against the real ArmorIQ platform (2026-08-20):
+- `capture_plan()` + `get_intent_token()`: work (real tokens issued).
+- `delegate()` (legacy CSRG path): **DEAD on this platform** - the live endpoint
+  /iap/trust/delegate responds 400 `{"message":"parentToken is required"}`. The
+  legacy payload shape (`token`/`delegate_public_key`/`validity_seconds`) is rejected.
+- `delegate_subtree()`: **the working delegation mechanism** - posts
+  `parentToken`/`delegatePublicKey`/`validitySeconds`/`subtreePath`/`planId` to the
+  same endpoint and mints real subtree-bounded delegated tokens (trust_id,
+  inclusion_proof, subtree_root, delegated_token with `subtree_delegation` metadata
+  that invoke() auto-attaches as X-CSRG-Subtree-* headers).
 
 The central authority model (Architecture Decision / authority matrix):
 
     Commander (root intent token over the full 4-step plan)
-     ├── log_agent          -> ["search_logs"]
-     ├── diagnosis_agent    -> ["get_service_status", "inspect_service_state"]
-     └── remediation_agent  -> ["restart_service"]
+     ├── log_agent          -> steps [search_logs]
+     ├── diagnosis_agent    -> steps [get_service_status, inspect_service_state]
+     └── remediation_agent  -> steps [restart_service]
+
+Each child's authority is expressed as a SUBTREE of the captured plan (step
+indices), minted by the platform via delegate_subtree(). The platform's proxy
+(PEP) rejects invocations outside the subtree at invoke() time.
 
 Hard invariants enforced here, in tests, and by ArmorIQ itself:
 - diagnosis_agent MUST NOT receive restart_service
@@ -23,6 +29,11 @@ Hard invariants enforced here, in tests, and by ArmorIQ itself:
 - the delegated token is held in memory only; safe metadata only is serialized
 
 Never log, serialize, or persist tokens (raw_token/jwt_token) or keys.
+
+NOTE: the `subtree_path` wire format (comma-separated step indices, e.g. "1,2")
+was accepted by the live platform for token minting; the proxy PEP's exact path
+grammar is verified during Phase 8/9 live enforcement testing (MCPs must be
+registered and reachable for invoke() to reach the PEP).
 """
 
 from __future__ import annotations
@@ -31,7 +42,7 @@ import time
 from typing import Any
 
 from armoriq.client_setup import ensure_keypair, public_key_hex
-from armoriq_sdk import DelegationResult
+from armoriq.plan import PLAN_ACTIONS
 from armoriq_sdk.models import IntentToken
 
 # The exact action names, matching the MCP layer tools 1:1 (no invented names).
@@ -70,6 +81,17 @@ def delegation_validity_seconds() -> int:
     return int(os.environ.get("AEGISOPS_DELEGATION_VALIDITY", "300"))
 
 
+def subtree_path_for(agent: str) -> str:
+    """The plan-subtree step indices for an agent's verified scope.
+
+    Derived deterministically from PLAN_ACTIONS so the delegation always names
+    exactly the steps the agent may take (and nothing more).
+    """
+    index_by_action = {action: str(i) for i, action in enumerate(PLAN_ACTIONS)}
+    indices = [index_by_action[action] for action in DELEGATION_SCOPES[agent]]
+    return ",".join(indices)
+
+
 class DelegationRecord:
     """A single in-memory delegation. The token is never serialized or logged."""
 
@@ -102,15 +124,17 @@ class DelegationRecord:
         self.token = token
 
     @classmethod
-    def from_result(cls, agent: str, result: DelegationResult) -> "DelegationRecord":
+    def from_subtree(cls, agent: str, payload: dict[str, Any]) -> "DelegationRecord":
+        """Build a record from the live delegate_subtree() response dict."""
+        delegated_token = payload["delegated_token"]
         return cls(
             agent=agent,
-            delegation_id=result.delegation_id,
+            delegation_id=str(payload.get("trust_id") or delegated_token.token_id),
             allowed_actions=list(DELEGATION_SCOPES[agent]),
-            expires_at=float(result.expires_at or 0),
-            status=result.status or "delegated",
-            target_agent=result.target_agent,
-            token=result.delegated_token,
+            expires_at=float(getattr(delegated_token, "expires_at", 0) or 0),
+            status="delegated",
+            target_agent=agent,
+            token=delegated_token,
         )
 
     def metadata(self) -> dict[str, Any]:
@@ -148,10 +172,11 @@ def create_delegations(
 ) -> dict[str, DelegationRecord]:
     """Create the three delegated authorities from the Commander's root token.
 
-    Each child gets exactly its verified scope, bound to its own public key.
-    Raises ScopeValidationError before any network call if a scope is wrong.
-    Raises armoriq_sdk.DelegationException / ArmorIQException on failure - the
-    caller records the failure; nothing is faked.
+    Uses the platform's verified subtree-delegation mechanism
+    (delegate_subtree()): each child gets exactly its verified scope, expressed
+    as a plan subtree, bound to its own public key. Raises ScopeValidationError
+    before any network call if a scope is wrong. Raises armoriq_sdk exceptions
+    on failure - the caller records the failure; nothing is faked.
     """
     validity = validity_seconds if validity_seconds is not None else delegation_validity_seconds()
     if validity <= 0:
@@ -161,14 +186,14 @@ def create_delegations(
     for agent, scope in DELEGATION_SCOPES.items():
         _validate_scope(agent, scope)
         pubkey = public_key_hex(ensure_keypair(agent))
-        result = client.delegate(
-            intent_token=root_token,
+        result = client.delegate_subtree(
+            root_token,
             delegate_public_key=pubkey,
+            subtree_path=subtree_path_for(agent),
             validity_seconds=validity,
-            allowed_actions=list(scope),
             target_agent=agent,
         )
-        records[agent] = DelegationRecord.from_result(agent, result)
+        records[agent] = DelegationRecord.from_subtree(agent, result)
     return records
 
 
@@ -191,4 +216,5 @@ __all__ = [
     "delegations_metadata",
     "delegation_validity_seconds",
     "is_expired",
+    "subtree_path_for",
 ]

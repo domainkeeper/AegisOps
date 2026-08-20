@@ -153,6 +153,13 @@ class DiagnosisResult(BaseModel):
     remediation_attempted: bool = False
     remediation_result: dict[str, Any] | None = None
     llm_source: str = "none"  # "llm" | "fallback" | "none"
+    # Phase 8: the deliberate governed restart attempt (same action as the
+    # Remediation Agent, different authority). Recorded honestly - blocked or
+    # otherwise - never fabricated and never silently skipped.
+    governed_restart_attempted: bool = False
+    governed_restart_blocked: bool = False
+    governed_restart_error: str | None = None
+    governed_restart_result: dict[str, Any] | None = None
     status: str = "ok"
     error: str | None = None
 

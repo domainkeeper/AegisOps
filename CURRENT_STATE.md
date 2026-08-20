@@ -3,6 +3,8 @@
 ## Project Status
 
 **Phase 6 + 7 (ArmorIQ delegation + governed invocation + audit mirror) — completed (2026-08-20).**
+**Phase 8 + 9 (enforcement demonstration: blocked diagnosis attempt / allowed remediation) — code +
+offline tests completed (2026-08-20); live verification pending MCP registration.**
 
 Phase 2 built the real incident infrastructure (`auth-api` + Docker + scripts). Phase 3 built the MCP layer
 (three servers, four tools, real restart, official MCP SDK). Phase 4 built the four-agent system on top:
@@ -12,13 +14,25 @@ complete incident now runs from break → investigation → diagnosis → restar
 single command (`scripts/run_incident.sh`). Phase 5 added the four agent identities (Ed25519 keypairs +
 email scopes) and the Commander's explicit 4-step execution plan captured with ArmorIQ (`capture_plan` →
 `get_intent_token`). Phase 6 added the authority model: the Commander delegates three narrowly-scoped
-authorities from the root intent token (`delegate()` ×3, diagnosis scope deliberately excludes
-`restart_service`). Phase 7 wired the governed path: when a child holds a delegation it invokes its MCP
-actions **through ArmorIQ** (`invoke()` → proxy → MCP), and every governed/audit-relevant event is mirrored
-into a local SQLite audit mirror (safe metadata only; ArmorIQ stays the source of truth). With no ArmorIQ
-credentials the entire system runs the unguarded Phase 4 baseline unchanged and reports it honestly
-(`delegations: []`, `governed: false`). Enforcement demos (blocked/denied demonstrations) are Phase 8 — the
-code contains no fake authorization rules today.
+authorities from the root intent token (`delegate_subtree()` ×3, live-verified mechanism, diagnosis scope
+deliberately excludes `restart_service`). Phase 7 wired the governed path: when a child holds a delegation
+it invokes its MCP actions **through ArmorIQ** (`invoke()` → proxy → MCP), and every governed/audit-relevant
+event is mirrored into a local SQLite audit mirror (safe metadata only; ArmorIQ stays the source of truth).
+Phase 8 turned the Diagnosis Agent's restart attempt into a deliberate governed probe: it submits
+`restart_service("auth-api")` with its own read-only authority, ArmorIQ **blocks** it, the outcome is
+recorded on the `DiagnosisResult` (`governed_restart_attempted/blocked/error/result`) and audited
+(`status="blocked"`) — never fatal, never faked, no keyword filtering, no local policy layer pretending to
+be ArmorIQ. Phase 9: the Remediation Agent performs the identical call with its own authority — ArmorIQ
+**allows** it and the container really restarts. With no ArmorIQ credentials the entire system runs the
+unguarded Phase 4 baseline unchanged and reports it honestly (`delegations: []`, `governed: false`).
+
+**Live-verified against the real ArmorIQ platform (2026-08-20):** the `.env` `ARMORIQ_API_KEY` is a real,
+working `ak_live_...` key — real intent tokens were issued (`scripts/armoriq_plan_token.py`) and real
+delegations were minted. The legacy `delegate()` path is DEAD on this platform (400 `parentToken is
+required`); `delegate_subtree()` is the working mechanism. `invoke()` currently cannot reach the MCPs
+(`Internal Proxy Error`) because no MCPs are registered yet — the user will register `log-mcp`,
+`diagnostic-mcp`, `remediation-mcp` with public tunnel URLs; the live blocked/allowed run then completes
+Phase 8/9 (`tests/test_live_authorization.py`, self-skipping; `scripts/run_enforcement_demo.sh`).
 
 ## Completed
 
@@ -94,10 +108,12 @@ code contains no fake authorization rules today.
     + tests): `log_agent → ["search_logs"]`, `diagnosis_agent → ["get_service_status",
     "inspect_service_state"]`, `remediation_agent → ["restart_service"]`. `create_delegations()` verifies
     the scope against `_VERIFIED_SCOPES` **before any network call** (`ScopeValidationError`), binds each
-    delegation to the child's own Ed25519 public key (`ensure_keypair`), and calls the verified SDK method
-    `delegate(intent_token, delegate_public_key, validity_seconds, allowed_actions, target_agent)`.
-    Delegated-token validity: `AEGISOPS_DELEGATION_VALIDITY` (default 300s, shorter than the root token per
-    SDK design).
+    delegation to the child's own Ed25519 public key (`ensure_keypair`), and calls the **live-verified**
+    `delegate_subtree(intent_token, delegate_public_key=..., subtree_path=..., validity_seconds=...,
+    target_agent=...)` — each delegation is a SUBTREE of the captured plan (`subtree_path_for()`: log
+    `"0"`, diagnosis `"1,2"`, remediation `"3"`). The legacy `delegate()` payload is rejected by the live
+    platform (400 `parentToken is required`) and is not used. Delegated-token validity:
+    `AEGISOPS_DELEGATION_VALIDITY` (default 300s, shorter than the root token per SDK design).
   - **Commander delegation** — `IncidentContext` keeps the root token in memory only (`_root_token`); after
     a successful intent handshake the Commander delegates to all three children (`_delegate_intents`,
     best-effort: any failure records `delegation_error` + audit row and the incident continues **unguarded**
@@ -117,40 +133,61 @@ code contains no fake authorization rules today.
   - **Mode selection — no env flag** — a request carries `authority` → the agent uses the governed path;
     otherwise the Phase 4 unguarded direct-MCP path runs unchanged (regression-preserving by construction).
     Governed mode: Log Agent calls `log-mcp.search_logs` through ArmorIQ; Diagnosis Agent calls
-    `diagnostic-mcp.get_service_status` + `inspect_service_state` through ArmorIQ and (correctly holding no
-    restart authority) defers remediation to the Remediation Agent; Remediation Agent calls
+    `diagnostic-mcp.get_service_status` + `inspect_service_state` through ArmorIQ; Remediation Agent calls
     `remediation-mcp.restart_service` through ArmorIQ (its health-check probe stays a direct read-only MCP
-    call). The deliberate blocked demonstration is Phase 8.
+    call).
   - **Audit mirror** — `database/audit.py` + `database/__init__.py`: SQLite `audit_events` table
     (incident_id, agent, parent_agent, action, status, delegation_id, error_type, detail, created_at), env
     `AEGISOPS_AUDIT_DB` (default `database/audit.db`, gitignored). Safe metadata only: the store refuses
     tokens/keys/signatures (`_FORBIDDEN_FIELDS`, asserted by tests). Writes are best-effort and never break
     the incident flow. This is a thin local mirror — ArmorIQ remains the source of truth.
-  - **Tests** — `tests/test_phase67.py` (17 tests): exact scopes, diagnosis excludes `restart_service`,
-    remediation includes it, delegation bound to each child's own public key, safe metadata only, scope
-    validation blocks before any network call, delegation failure → unguarded + recorded, token material
-    never in `IncidentResult`, governed success propagates MCP results, blocked/invalid-token surface +
-    audit rows with the verified error type, audit mirror never stores secrets, E2E asserts
-    `delegations: []` + `governed: false` on the no-key run. Full suite: **110 tests pass** (83 fast/offline
-    + 27 Docker-dependent).
+  - **Tests** — `tests/test_phase67.py` (20 tests): exact subtree scopes ("0"/"1,2"/"3"), diagnosis excludes
+    `restart_service`, remediation includes it, delegation bound to each child's own public key, safe
+    metadata only, scope validation blocks before any network call, delegation failure → unguarded +
+    recorded, token material never in `IncidentResult`, governed success propagates MCP results,
+    blocked/invalid-token surface + audit rows with the verified error type, audit mirror never stores
+    secrets, Phase 8 probe (blocked/unreachable/unexpected-allowance all recorded, never fatal), E2E asserts
+    `delegations: []` + `governed: false` on the no-key run. Full suite: **113 tests pass** (offline;
+    `tests/test_live_authorization.py` adds 3 live tests that self-skip without the live prerequisites).
   - **Test hygiene** — the suite now reclaims the agent/MCP ports at session start so stale processes left
     by demo scripts can never poison results.
+- **Phase 8 (2026-08-20) — the violation + enforcement (Diagnosis Agent's blocked restart attempt)**:
+  - `attempt_governed_restart()` in `agents/diagnosis_agent.py` — the deliberate probe: the Diagnosis Agent
+    submits `restart_service("auth-api")` through `invoke_governed` with ITS OWN delegated authority
+    (read-only scope). ArmorIQ must reject it; whatever the platform decides is recorded honestly on
+    `DiagnosisResult` (`governed_restart_attempted/blocked/error/result`) — the probe is never fatal, never
+    faked, and there is no keyword filter, agent-name check, or local policy layer. If ArmorIQ is
+    unreachable the failure is recorded and the incident fails honestly — no governed→unguarded downgrade
+    during the demonstration. `invoke_governed` audits the attempt (`status="blocked"`, verified exception
+    type).
+  - `scripts/run_enforcement_demo.sh` — one deterministic run, two scenes: Scene 1 (blocked, proof: Docker
+    `StartedAt` unchanged) and Scene 2 (allowed, proof: `StartedAt` changed, `/health` healthy), with the
+    audit mirror printed. Fails honestly if governed mode cannot activate.
+  - Offline tests: `test_phase8_blocked_attempt_recorded_and_not_fatal`,
+    `test_phase8_unreachable_attempt_recorded_not_fatal`,
+    `test_phase8_unexpected_allowance_surfaces_honestly` in `tests/test_phase67.py`.
+- **Phase 9 (2026-08-20) — authorized remediation**: the Remediation Agent performs the SAME
+  `restart_service("auth-api")` with its own delegation; the governed path already executes the real
+  restart through `remediation-mcp` (Phase 7). `tests/test_live_authorization.py` (3 live tests,
+  self-skipping): real delegations with exact scopes, live blocked (StartedAt unchanged + audit blocked),
+  live allowed (StartedAt changed + /health 200 + audit success). The live rejection exception class is
+  OBSERVED and recorded by these tests — never hardcoded before it is seen.
 
 ## In Progress
 
-- Live verification of delegation + governed invocation against a real ArmorIQ account (needs a real
-  `ARMORIQ_API_KEY` and the MCP registration/connectivity mode).
+- **Live Phase 8/9 enforcement run** — real key obtained and verified (real intent tokens + real subtree
+  delegations minted 2026-08-20); the run is blocked only on registering the three MCPs (`log-mcp`,
+  `diagnostic-mcp`, `remediation-mcp`) with public HTTPS tunnel URLs so the hosted ArmorIQ proxy can reach
+  them. The user will register them; `tests/test_live_authorization.py` then verifies blocked + allowed
+  live, and `scripts/run_enforcement_demo.sh` runs the two-scene demonstration.
 
 ## Not Started
 
-- Phase 8 — the violation + enforcement demonstration (Diagnosis Agent's restart attempt blocked by
-  ArmorIQ, deliberate; audit row; `PolicyBlockedException` runtime mapping).
-- Phase 9 — the authorized-remediation demonstration.
 - Phase 10 — testing + audit trail viewer + demo polish.
-- MCP registration on the ArmorIQ platform (needs a real API key + connectivity mode).
 - Trail viewer (Phase 10).
 - Real Gemini diagnosis has never been exercised end-to-end (no `AEGISOPS_GEMINI_API_KEY` on this machine).
-- Real `get_intent_token` / `delegate` / `invoke` never exercised end-to-end (no real `ARMORIQ_API_KEY`).
+- Token-expiry demonstration, post-diagnosis re-delegation, onward delegation (explicitly OUT of scope for
+  Phases 8/9 — see PLAN §13).
 
 ## Architecture Decisions
 
@@ -200,11 +237,16 @@ read), 2026-08-19/20:
 - `get_intent_token(plan_capture, policy=None, validity_seconds=60.0) -> IntentToken` — network; token carries
   `plan_hash`, `step_proofs`, `expires_at`, etc. The token object is SENSITIVE (`raw_token`/`jwt_token`) and is
   never logged or serialized in this project.
-- `delegate(intent_token, delegate_public_key, validity_seconds=3600, allowed_actions=None, target_agent=None,
-  subtask=None) -> DelegationResult` — network (`/iap/trust/delegate`); `delegate_public_key` is
-  raw-bytes-hex Ed25519 public key; `allowed_actions`/`target_agent`/`subtask` are only included in the
-  payload when truthy. Result fields: `delegation_id`, `delegated_token` (IntentToken whose `raw_token` is
-  `{"token": ...}`), `delegate_public_key`, `target_agent`, `expires_at`, `trust_delta`, `status`, `metadata`.
+- `delegate_subtree(intent_token, *, delegate_public_key, subtree_path, validity_seconds=3600, parent_plan,
+  plan_id, intent_reference, target_agent)` — **network, LIVE-VERIFIED 2026-08-20**: posts
+  `parentToken`/`delegatePublicKey`/`validitySeconds`/`subtreePath`/`planId` to `/iap/trust/delegate` and
+  mints real subtree-bounded delegated tokens (`trust_id`, `inclusion_proof`, `subtree_root`,
+  `delegated_token` with `subtree_delegation` metadata that `invoke()` auto-attaches as X-CSRG-Subtree-*
+  headers). The legacy `delegate()` payload is DEAD on this platform (400 `parentToken is required`).
+  `delegate_public_key` is a raw-bytes-hex Ed25519 public key. Subtree paths tested live: `"0"`, `"1,2"`,
+  `"3"`, `"1,2,3"`, `"*"` all minted.
+- `list_mcps()` — network; returns the registered MCPs on the platform (currently `[]` — nothing registered
+  yet; the user will register the three MCP servers).
 - `invoke(mcp, action, intent_token, params=None, merkle_proof=None, user_email=None) -> MCPInvocationResult` —
   network (proxy `/invoke`); **local fail-closed checks run before any network call**:
   `TokenExpiredException` if the token is expired, `IntentMismatchException` if the action is not in the
@@ -223,21 +265,23 @@ read), 2026-08-19/20:
 - **MCP transport (Phase 3):** official MCP Python SDK `mcp==2.0.0` (Streamable HTTP, SSE responses,
   2025-era `initialize`/`tools/list`/`tools/call` + 2026-era protocol served from one server).
 
-## Known Unknowns / Limitations (Phase 6 + 7)
+## Known Unknowns / Limitations (Phase 8 + 9)
 
-- **Real delegation + governed invocation not exercised** — no real `ARMORIQ_API_KEY`; `delegate()` and
-  `invoke()` have never been called live. Built against the verified SDK signatures/source and exercised via
-  stubs; without a key the system honestly reports `delegations: []` / `governed: false` and runs the
-  unguarded Phase 4 baseline. All documented failure behavior comes from the SDK source, not live runs.
+- **Live invoke() enforcement not yet run** — real intent tokens and real subtree delegations have been
+  minted live, but `invoke()` cannot reach the MCPs until they are registered on the platform with public
+  tunnel URLs (proxy returns `Internal Proxy Error`/`MCPInvocationException` while `list_mcps()` is empty).
+  The blocked/allowed live proof is staged in `tests/test_live_authorization.py` and
+  `scripts/run_enforcement_demo.sh`.
 - Which exact exception a delegated-token scope violation raises in production (`IntentMismatchException` vs
-  `PolicyBlockedException`) — needs a runtime test with a real API key (Phase 8).
+  `PolicyBlockedException`) — OBSERVED live by `tests/test_live_authorization.py` (no hardcoded class) and
+  recorded in the audit row's `error_type`; run pending MCP registration.
 - Whether the hosted proxy requires per-MCP `PROXY_URL` config or accepts the default endpoint once MCPs are
-  registered — needs a live test.
+  registered — needs the live run.
 - Real Gemini diagnosis not exercised — no `AEGISOPS_GEMINI_API_KEY` on this machine; all runs used the
   explicitly-marked deterministic test fallback (`llm_source: "fallback"`). The Gemini path is unit-tested
-  via stubs, not live-tested.
+  via stubs, not live-tested. (Authorization decisions never depend on the LLM.)
 - Which tunnel provider (if any) will be used when the hosted proxy must reach the MCPs — deployment concern,
-  not yet decided.
+  not yet decided; the user will register the MCPs with tunnel URLs.
 - Commander keeps one incident in memory (no persistence; single-incident demo scope by design).
 - Agent logs are per-process files under `logs/agents/`; no centralized observability (by design).
 - The audit mirror is a thin local SQLite mirror (safe metadata only) — it is not a replacement for the
@@ -245,31 +289,42 @@ read), 2026-08-19/20:
 
 ## Next Steps
 
-1. **Phase 5 — ArmorIQ identities + plan — DONE** (keypairs, emails, explicit 4-step plan, capture + token
-   handshake, Gemini LLM).
-2. **Phase 6 — ArmorIQ delegation — DONE** (`delegate()` ×3, verified scopes, key binding, in-memory tokens).
-3. **Phase 7 — governed invocation + audit mirror — DONE** (`invoke()` into the governed paths, mode
-   selection by authority, SQLite mirror).
-4. Phase 8 — the violation + enforcement: Diagnosis Agent's restart attempt **blocked** by ArmorIQ
-   (deliberate demonstration); audit row; runtime exception mapping.
-5. Phase 9 — authorized remediation: post-diagnosis delegation → Remediation Agent's restart **allowed**.
-6. Phase 10 — testing + audit trail + demo polish.
+1. **Phases 5–7 — identities, plan, delegation, governed invocation, audit mirror — DONE.**
+2. **Phase 8 — violation + enforcement — DONE (code + offline tests)**: deliberate governed restart probe
+   (`attempt_governed_restart`), honest blocked/error/allowed recording on `DiagnosisResult`, audit
+   `status="blocked"`, `scripts/run_enforcement_demo.sh`.
+3. **Phase 9 — authorized remediation — DONE (code + offline tests)**: same action, different delegated
+   authority, allowed path already wired (Phase 7); `tests/test_live_authorization.py` staged.
+4. **Live Phase 8/9 run** (BLOCKED on MCP registration with tunnel URLs — the user registers
+   `log-mcp`/`diagnostic-mcp`/`remediation-mcp`): run `tests/test_live_authorization.py -m live` and
+   `scripts/run_enforcement_demo.sh`; record the observed rejection exception; verify StartedAt unchanged
+   (blocked) / changed (allowed) + audit rows.
+5. Phase 10 — testing + audit trail + demo polish (only after the live run).
 
 ## Blockers
 
-- No real `ARMORIQ_API_KEY` yet — needed for live delegation/invocation, the MCP registration flow, and the
-  Phase 8 blocked-path exception type. Phases 4-7 work without it (unguarded baseline + honest
-  `not_configured` / `delegations: []`).
-- No `AEGISOPS_GEMINI_API_KEY` on this machine — needed to exercise a real Gemini diagnosis.
-- Hosted-proxy MCP invocation additionally requires the connectivity mode (tunnel vs self-hosted proxy) to be
-  exercised end-to-end.
+- **MCP registration with public tunnel URLs** — the only remaining blocker for the live Phase 8/9 run: the
+  hosted ArmorIQ proxy cannot reach localhost, so `log-mcp`/`diagnostic-mcp`/`remediation-mcp` must be
+  registered on the platform with HTTPS URLs reachable by the proxy. The user will register them.
+- No `AEGISOPS_GEMINI_API_KEY` on this machine — needed to exercise a real Gemini diagnosis (not required
+  for authorization, which never depends on the LLM).
 
 ## Definition of Ready (Phase 8 — violation + enforcement demonstration)
 
-- [x] Phase 6 + 7 complete (delegation + governed invocation + audit mirror implemented; 110 tests pass)
+- [x] Phase 6 + 7 complete (delegation + governed invocation + audit mirror implemented; 113 tests pass)
 - [x] Diagnosis Agent's delegation excludes `restart_service` (enforced + tested)
 - [x] Governed invocation surfaces ArmorIQ rejections with the verified exception type (stub-tested)
-- [ ] Real `ARMORIQ_API_KEY` obtained
+- [x] Real `ARMORIQ_API_KEY` obtained and verified (real intent tokens + real subtree delegations minted live)
+- [x] Phase 8 probe implemented + offline-tested (blocked/unreachable/unexpected-allowance all recorded,
+      never fatal; audit `status="blocked"`; no keyword filtering, no local policy layer)
+- [x] Phase 9 allowed path implemented (same action, different delegated authority; real restart already
+      proven unguarded + governed via MCP)
+- [x] Live test staged (`tests/test_live_authorization.py` — self-skipping; observes the REAL exception class)
+- [x] Demo script staged (`scripts/run_enforcement_demo.sh` — Scene 1 blocked / Scene 2 allowed with Docker
+      StartedAt proof; fails honestly if governed mode cannot activate)
 - [ ] MCPs registered on the platform with exact names (`log-mcp`, `diagnostic-mcp`, `remediation-mcp`)
-- [ ] MCP connectivity mode exercised (tunnel or self-hosted proxy)
-- [ ] Live blocked path reproduced (Diagnosis Agent's governed `restart_service` attempt denied)
+      + public HTTPS tunnel URLs
+- [ ] Live blocked path reproduced (Diagnosis Agent's governed `restart_service` attempt denied, StartedAt
+      unchanged, audit blocked)
+- [ ] Live allowed path reproduced (Remediation Agent's `restart_service` accepted, StartedAt changed,
+      /health healthy, audit success)

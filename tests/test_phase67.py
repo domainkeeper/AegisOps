@@ -1,14 +1,16 @@
-"""Phase 6 + 7 tests: delegation, governed invocation, audit mirror.
+"""Phase 6 + 7 + 8 tests: delegation, governed invocation, audit mirror.
 
-Verified SDK surface (armoriq-sdk 0.6.10, source-inspected 2026-08-20):
-- delegate(intent_token, delegate_public_key, validity_seconds=3600,
-  allowed_actions=None, target_agent=None, subtask=None) -> DelegationResult
+Verified SDK surface (armoriq-sdk 0.6.10, source-inspected + LIVE-verified
+2026-08-20):
+- delegate_subtree(intent_token, *, delegate_public_key, subtree_path,
+  validity_seconds, parent_plan, plan_id, intent_reference, target_agent)
+  -> {trust_id, delta, inclusion_proof, subtree_root, delegated_token}
 - invoke(mcp, action, intent_token, params=None, merkle_proof=None,
   user_email=None) -> MCPInvocationResult
 - ArmorIQ rejections surface as ArmorIQException subclasses; nothing is faked.
 
 Covered here (no network, no real key):
-- three delegations with the exact verified scopes
+- three delegations with the exact verified subtree scopes
 - diagnosis scope EXCLUDES restart_service; remediation INCLUDES it
 - delegation bound to each child's own Ed25519 public key
 - safe metadata only; tokens never serialized in results or audit rows
@@ -16,6 +18,8 @@ Covered here (no network, no real key):
 - governed invoke rejection surfaces + audits the verified error type
 - audit mirror records safe metadata and refuses secrets
 - delegation failure keeps the unguarded baseline working
+- Phase 8: the Diagnosis Agent's deliberate governed restart attempt is
+  recorded (blocked/error/allowed) on the result - never fatal, never faked
 """
 
 from __future__ import annotations
@@ -26,12 +30,13 @@ from time import time
 
 import pytest
 from armoriq_sdk import DelegationException, PolicyBlockedException, InvalidTokenException
-from armoriq_sdk.models import DelegationResult, IntentToken, MCPInvocationResult
+from armoriq_sdk.models import IntentToken, MCPInvocationResult
 
 from armoriq import client_setup
 from armoriq.delegation import DELEGATION_SCOPES, create_delegations, delegations_metadata
-from agents.common import DelegatedAuthority, Incident, invoke_governed
+from agents.common import AgentError, DelegatedAuthority, Incident, invoke_governed
 from agents.commander import IncidentContext, _capture_intent, _to_error_result
+from agents.diagnosis_agent import DiagnosisRequest
 from database.audit import AuditStore
 
 
@@ -53,21 +58,15 @@ def _token(token_id: str = "tok-1") -> IntentToken:
     )
 
 
-def _delegation_result(agent: str, token: IntentToken, delegation_id: str) -> DelegationResult:
-    return DelegationResult(
-        delegation_id=delegation_id,
-        delegated_token=token,
-        delegate_public_key="k" * 64,
-        expires_at=token.expires_at,
-        trust_delta={},
-        status="delegated",
-        target_agent=agent,
-        metadata={},
-    )
-
-
 class RecordingClient:
-    """Stub client recording every SDK call; delegate/invoke programmable."""
+    """Stub client recording every SDK call; delegate_subtree/invoke programmable.
+
+    Mirrors the LIVE-verified delegation mechanism (2026-08-20): the platform's
+    /iap/trust/delegate endpoint requires the subtree API (parentToken,
+    camelCase) - the legacy delegate() payload is rejected with 400
+    "parentToken is required". delegate_subtree() returns a dict with
+    trust_id / inclusion_proof / subtree_root / delegated_token.
+    """
 
     def __init__(self, root_token: IntentToken | None = None) -> None:
         self.root_token = root_token or _token()
@@ -83,12 +82,35 @@ class RecordingClient:
     def get_intent_token(self, plan_capture, **kwargs):
         return self.root_token
 
-    def delegate(self, **kwargs):
+    def delegate_subtree(self, intent_token, *, delegate_public_key, subtree_path,
+                         validity_seconds=300, parent_plan=None, plan_id=None,
+                         intent_reference=None, target_agent=None):
         if self.delegate_error is not None:
             raise self.delegate_error
-        self.delegate_calls.append(kwargs)
-        agent = kwargs["target_agent"]
-        return _delegation_result(agent, _token(f"tok-{agent}"), f"did-{agent}")
+        self.delegate_calls.append({
+            "intent_token": intent_token,
+            "delegate_public_key": delegate_public_key,
+            "subtree_path": subtree_path,
+            "validity_seconds": validity_seconds,
+            "target_agent": target_agent,
+        })
+        token = _token(f"tok-{target_agent}")
+        token = token.model_copy(update={
+            "subtree_delegation": {
+                "subtree_path": subtree_path,
+                "subtree_root": "root",
+                "parent_plan_hash": "hash",
+                "inclusion_proof": ["proof"],
+                "parent_token_id": intent_token.token_id,
+            }
+        })
+        return {
+            "trust_id": f"trust-{target_agent}",
+            "delta": {},
+            "inclusion_proof": ["proof"],
+            "subtree_root": "root",
+            "delegated_token": token,
+        }
 
     def invoke(self, **kwargs):
         if self.invoke_error is not None:
@@ -112,9 +134,10 @@ def test_three_delegations_created_with_exact_scopes(monkeypatch, tmp_path):
     client = RecordingClient()
     records = create_delegations(client, client.root_token)
     assert set(records) == {"log_agent", "diagnosis_agent", "remediation_agent"}
-    assert client.delegate_calls[0]["allowed_actions"] == ["search_logs"]
-    assert client.delegate_calls[1]["allowed_actions"] == ["get_service_status", "inspect_service_state"]
-    assert client.delegate_calls[2]["allowed_actions"] == ["restart_service"]
+    paths = {c["target_agent"]: c["subtree_path"] for c in client.delegate_calls}
+    # Live-verified subtree API: each delegation carries ONLY its plan steps
+    # (log=step0, diagnosis=steps1-2, remediation=step3=restart_service).
+    assert paths == {"log_agent": "0", "diagnosis_agent": "1,2", "remediation_agent": "3"}
 
 
 def test_diagnosis_scope_excludes_restart_service(monkeypatch, tmp_path):
@@ -123,6 +146,10 @@ def test_diagnosis_scope_excludes_restart_service(monkeypatch, tmp_path):
     records = create_delegations(client, client.root_token)
     assert "restart_service" not in records["diagnosis_agent"].allowed_actions
     assert DELEGATION_SCOPES["diagnosis_agent"] == ["get_service_status", "inspect_service_state"]
+    # the restart step is index 3 in the plan -> "3" must not be in its subtree
+    diag_path = next(c["subtree_path"] for c in client.delegate_calls
+                     if c["target_agent"] == "diagnosis_agent")
+    assert "3" not in diag_path
 
 
 def test_remediation_scope_includes_restart_service(monkeypatch, tmp_path):
@@ -255,14 +282,28 @@ def test_incident_result_never_contains_token_material(monkeypatch, tmp_path):
                 raw_token={"token": {"token_id": "SECRET-ROOT", "jwt_token": "JWT-SECRET"}},
             )
 
-        def delegate(self, **kwargs):
-            self.delegate_calls.append(kwargs)
+        def delegate_subtree(self, intent_token, *, delegate_public_key, subtree_path,
+                             validity_seconds=300, parent_plan=None, plan_id=None,
+                             intent_reference=None, target_agent=None):
+            self.delegate_calls.append({
+                "intent_token": intent_token,
+                "delegate_public_key": delegate_public_key,
+                "subtree_path": subtree_path,
+                "validity_seconds": validity_seconds,
+                "target_agent": target_agent,
+            })
             token = IntentToken(
                 token_id="SECRET-CHILD", plan_hash="h" * 64, signature="sig",
                 issued_at=1.0, expires_at=time() + 300, composite_identity="c",
                 raw_token={"token": {"token_id": "SECRET-CHILD", "jwt_token": "JWT-SECRET"}},
             )
-            return _delegation_result(kwargs["target_agent"], token, "did-secret")
+            return {
+                "trust_id": "did-secret",
+                "delta": {},
+                "inclusion_proof": ["proof"],
+                "subtree_root": "root",
+                "delegated_token": token,
+            }
 
     monkeypatch.setattr(client_setup, "get_client", lambda: _SneakyClient())
     ctx = IncidentContext(_incident())
@@ -400,3 +441,73 @@ def test_audit_rows_have_incident_and_timestamp(tmp_path):
     store.record(incident_id="i-9", agent="log_agent", action="log-mcp.search_logs", status="success")
     row = store.recent(1)[0]
     assert row["incident_id"] == "i-9" and row["created_at"] and row["agent"] == "log_agent"
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: the Diagnosis Agent's deliberate governed restart attempt
+# ---------------------------------------------------------------------------
+
+
+def _diagnosis_req() -> DiagnosisRequest:
+    token = _token("tok-diagnosis_agent")
+    authority = DelegatedAuthority(
+        agent="diagnosis_agent",
+        delegation_id="did-diagnosis_agent",
+        allowed_actions=list(DELEGATION_SCOPES["diagnosis_agent"]),
+        expires_at=token.expires_at,
+        target_agent="diagnosis_agent",
+        token=token.model_dump(),
+    )
+    return DiagnosisRequest(
+        incident_id="p67-8",
+        service="auth-api",
+        evidence=[],
+        status={},
+        state={},
+        authority=authority,
+    )
+
+
+def test_phase8_blocked_attempt_recorded_and_not_fatal(monkeypatch):
+    from agents import diagnosis_agent as diag
+
+    def _blocked(*args, **kwargs):
+        raise AgentError(
+            "ArmorIQ governed call remediation-mcp.restart_service rejected "
+            "(PolicyBlockedException): delegated token does not permit restart_service"
+        )
+
+    monkeypatch.setattr(diag, "invoke_governed", _blocked)
+    out = diag.attempt_governed_restart(_diagnosis_req(), "auth-api")
+    assert out["attempted"] is True
+    assert out["blocked"] is True
+    assert "PolicyBlockedException" in out["error"]
+    assert out["result"] is None
+
+
+def test_phase8_unreachable_attempt_recorded_not_fatal(monkeypatch):
+    from agents import diagnosis_agent as diag
+
+    def _down(*args, **kwargs):
+        raise AgentError(
+            "ArmorIQ governed call remediation-mcp.restart_service failed "
+            "(MCPInvocationException): {'success': False, 'error': 'Internal Proxy Error'}"
+        )
+
+    monkeypatch.setattr(diag, "invoke_governed", _down)
+    out = diag.attempt_governed_restart(_diagnosis_req(), "auth-api")
+    assert out["attempted"] is True
+    assert out["blocked"] is False
+    assert "MCPInvocationException" in out["error"]
+    assert out["result"] is None
+
+
+def test_phase8_unexpected_allowance_surfaces_honestly(monkeypatch):
+    from agents import diagnosis_agent as diag
+
+    monkeypatch.setattr(diag, "invoke_governed",
+                        lambda *a, **k: {"restarted": True, "service": "auth-api"})
+    out = diag.attempt_governed_restart(_diagnosis_req(), "auth-api")
+    assert out["attempted"] is True
+    assert out["blocked"] is False
+    assert out["result"] == {"restarted": True, "service": "auth-api"}

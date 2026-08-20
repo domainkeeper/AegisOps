@@ -80,6 +80,38 @@ async def _produce_diagnosis(
     )
 
 
+def attempt_governed_restart(req: DiagnosisRequest, service: str) -> dict:
+    """Phase 8 probe: deliberately attempt restart_service with THIS agent's
+    own delegated authority. The attempt goes Agent -> ArmorIQ invoke() ->
+    authorization -> MCP. The rejection is the expected, recorded outcome of
+    the probe (invoke_governed also writes the audit row with the verified
+    exception type). Never fatal, never faked, never a silent downgrade."""
+    log_event(logger, req.incident_id, "remediation_attempt_governed", "running",
+              agent="diagnosis_agent", action="restart_service",
+              delegation_id=req.authority.delegation_id)
+    try:
+        result = invoke_governed(
+            agent="diagnosis_agent",
+            authority=req.authority,
+            mcp="remediation-mcp",
+            action="restart_service",
+            params={"service_name": service},
+            incident_id=req.incident_id,
+        )
+        log_event(logger, req.incident_id, "remediation_attempt_governed", "ok", allowed=True)
+        return {"attempted": True, "blocked": False, "error": None, "result": result}
+    except AgentError as exc:
+        message = str(exc)
+        log_event(logger, req.incident_id, "remediation_attempt_governed", "error",
+                  error=message[:300])
+        return {
+            "attempted": True,
+            "blocked": "PolicyBlockedException" in message,
+            "error": message,
+            "result": None,
+        }
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"agent": "diagnosis-agent", "status": "ok"}
@@ -100,6 +132,8 @@ async def run_task(req: DiagnosisRequest) -> DiagnosisResult:
 
         remediation_attempted = False
         remediation_result = None
+        governed_attempt: dict = {"attempted": False, "blocked": False,
+                                  "error": None, "result": None}
         if output.requires_remediation:
             if output.recommended_action != "restart_service":
                 raise AgentError(
@@ -110,13 +144,24 @@ async def run_task(req: DiagnosisRequest) -> DiagnosisResult:
                     f"model targeted '{output.target_service}' but incident is about '{req.service}'"
                 )
             if governed:
-                # Governed mode: this agent's delegated authority intentionally
-                # EXCLUDES restart_service (verified authority matrix). The
-                # restart is performed only by the Remediation Agent. The
-                # deliberate blocked-attempt demonstration arrives in Phase 8.
-                log_event(logger, req.incident_id, "remediation_deferred", "ok",
-                          reason="governed mode: diagnosis authority excludes restart_service; "
-                                 "remediation agent performs the restart")
+                # Phase 8 centerpiece: the Diagnosis Agent deliberately attempts
+                # restart_service with ITS OWN delegated authority - the exact
+                # same action/tool the Remediation Agent will use. The attempt
+                # goes Agent -> ArmorIQ invoke() -> authorization -> MCP. Its
+                # authority does not include restart_service, so ArmorIQ must
+                # reject it. The probe is never fatal: whatever ArmorIQ decides
+                # is recorded honestly and the incident continues so the
+                # Remediation Agent performs the AUTHORIZED restart (Phase 9).
+                # If ArmorIQ is unreachable the probe records the failure and
+                # the remediation agent's own (also failing) call surfaces the
+                # real error - never a silent unguarded downgrade.
+                governed_attempt = attempt_governed_restart(req, output.target_service)
+                if governed_attempt["blocked"]:
+                    log_event(logger, req.incident_id, "remediation_attempt_blocked", "ok",
+                              error_type="PolicyBlockedException")
+                if governed_attempt["result"] is not None:
+                    remediation_attempted = True
+                    remediation_result = governed_attempt["result"]
             else:
                 log_event(logger, req.incident_id, "remediation_requested", "running",
                           action=output.recommended_action, target=output.target_service)
@@ -138,6 +183,10 @@ async def run_task(req: DiagnosisRequest) -> DiagnosisResult:
             target_service=output.target_service,
             remediation_attempted=remediation_attempted,
             remediation_result=remediation_result,
+            governed_restart_attempted=governed_attempt["attempted"],
+            governed_restart_blocked=governed_attempt["blocked"],
+            governed_restart_error=governed_attempt["error"],
+            governed_restart_result=governed_attempt["result"],
             llm_source=llm_source,
             status="ok",
         )
