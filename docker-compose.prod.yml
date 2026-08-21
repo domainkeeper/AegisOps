@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aegisops-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/api.Dockerfile
+    container_name: aegisops-api
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=production
+      - AEGISOPS_DATABASE_URL=database/aegisops.db
+      - AEGISOPS_AUDIT_DB=database/audit.db
+    volumes:
+      - ./database:/app/database
+    depends_on:
+      - auth-api
+    restart: unless-stopped
+
+  auth-api:
+    build:
+      context: ./infrastructure/auth_api
+    container_name: auth-api
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
