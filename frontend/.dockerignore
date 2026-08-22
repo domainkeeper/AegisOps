@@ -1,0 +1,40 @@
+# Frontend build output (generated at build time, not needed in context)
+dist/
+build/
+*.local
+
+# Dependencies
+node_modules/
+
+# Environment files (secrets should come from .env.production at runtime)
+.env
+.env.*
+.env.local
+.env.production
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Misc
+*.tgz
+.cache/

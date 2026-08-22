@@ -3,6 +3,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { Layout } from './components/Layout';
 import { LoadingState } from './components/LoadingState';
 import { Dashboard } from './pages/Dashboard';
+import { Incidents } from './pages/Incidents';
 import { IncidentDetail } from './pages/IncidentDetail';
 import { Security } from './pages/Security';
 import { Audit } from './pages/Audit';
@@ -34,7 +35,7 @@ function Router() {
       const id = path.split('/')[2];
       return <IncidentDetail incidentId={id} />;
     }
-    if (path === '/incidents') return <Dashboard />;
+    if (path === '/incidents') return <Incidents />;
     if (path === '/security') return <Security />;
     if (path === '/audit') return <Audit />;
     if (path === '/services') return <Services />;

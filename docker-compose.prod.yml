@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   frontend:
     build:
@@ -20,9 +18,43 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - APP_ENV=production
-      - AEGISOPS_DATABASE_URL=database/aegisops.db
-      - AEGISOPS_AUDIT_DB=database/audit.db
+      # ===== Core Application =====
+      - APP_ENV=${APP_ENV:-production}
+      - APP_HOST=${APP_HOST:-0.0.0.0}
+      - APP_PORT=${APP_PORT:-8000}
+
+      # ===== Authentication (REQUIRED in production) =====
+      - AEGISOPS_API_SECRET_KEY=${AEGISOPS_API_SECRET_KEY}
+      - AEGISOPS_API_PASSWORD=${AEGISOPS_API_PASSWORD}
+      - AEGISOPS_API_USERNAME=${AEGISOPS_API_USERNAME:-admin}
+
+      # ===== Database =====
+      - AEGISOPS_DATABASE_URL=${AEGISOPS_DATABASE_URL:-database/aegisops.db}
+      - AEGISOPS_AUDIT_DB=${AEGISOPS_AUDIT_DB:-database/audit.db}
+
+      # ===== CORS =====
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+
+      # ===== ArmorIQ (required for governed mode) =====
+      - ARMORIQ_API_KEY=${ARMORIQ_API_KEY}
+      - ARMORIQ_ENV=${ARMORIQ_ENV:-production}
+      - USE_PRODUCTION=${USE_PRODUCTION:-true}
+      - IAP_ENDPOINT=${IAP_ENDPOINT:-}
+      - PROXY_ENDPOINT=${PROXY_ENDPOINT:-}
+      - BACKEND_ENDPOINT=${BACKEND_ENDPOINT:-}
+
+      # ===== ArmorIQ Agent Email Scopes =====
+      - AEGISOPS_COMMANDER_EMAIL=${AEGISOPS_COMMANDER_EMAIL:-commander@aegisops.local}
+      - AEGISOPS_LOG_AGENT_EMAIL=${AEGISOPS_LOG_AGENT_EMAIL:-log_agent@aegisops.local}
+      - AEGISOPS_DIAGNOSIS_AGENT_EMAIL=${AEGISOPS_DIAGNOSIS_AGENT_EMAIL:-diagnosis_agent@aegisops.local}
+      - AEGISOPS_REMEDIATION_AGENT_EMAIL=${AEGISOPS_REMEDIATION_AGENT_EMAIL:-remediation_agent@aegisops.local}
+
+      # ===== Gemini LLM =====
+      - AEGISOPS_GEMINI_API_KEY=${AEGISOPS_GEMINI_API_KEY}
+      - AEGISOPS_LLM_MODEL=${AEGISOPS_LLM_MODEL:-gemini-3.5-flash-lite}
+      - AEGISOPS_LLM_TIMEOUT=${AEGISOPS_LLM_TIMEOUT:-30}
+      - AEGISOPS_LLM_FALLBACK=${AEGISOPS_LLM_FALLBACK:-test}
+
     volumes:
       - ./database:/app/database
     depends_on:

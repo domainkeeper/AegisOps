@@ -73,7 +73,7 @@ EXCLUDE_DIRS = {
     "node_modules", "database", "infrastructure",
 }
 # Files where placeholders / test keys are legitimate.
-SECRET_ALLOWED_PREFIXES = (".env.example", "tests/", "docs/")
+SECRET_ALLOWED_PREFIXES = (".env.example", ".env.production.example", "tests/", "docs/")
 # The only legitimate ak_test_ value (hermetic test placeholder).
 TEST_PLACEHOLDER = "ak_test_1234"
 
@@ -165,14 +165,15 @@ def main() -> int:
             continue
         for regex in SECRET_PATTERNS:
             for match in regex.finditer(text):
-                if rel == ".env.example" and match.group(0) in (
-                    "ak_test_replace_with_your_real_key",
-                ):
+                matched = match.group(0)
+                if rel == ".env.example" and matched == "ak_test_replace_with_your_real_key":
                     continue
-                if rel.startswith("tests/") and match.group(0) == TEST_PLACEHOLDER:
+                if rel == ".env.production.example" and matched == "ak_live_replace_with_your_real_key":
+                    continue
+                if rel.startswith("tests/") and matched == TEST_PLACEHOLDER:
                     continue
                 print(f"  [FAIL] {rel} contains {regex.pattern!r} match: "
-                      f"{match.group(0)[:20]}...")
+                      f"{matched[:20]}...")
                 findings += 1
 
     # docs/ mention key prefixes only - ensure no full values slipped in

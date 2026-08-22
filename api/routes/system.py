@@ -85,54 +85,87 @@ async def health_ready():
 # ---------------------------------------------------------------------------
 
 
-async def _async_probe(url: str, timeout: float = 5.0) -> str:
+async def _async_probe(url: str, timeout: float = 2.0) -> str:
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url)
         if resp.status_code < 500:
             return "online"
         return "error"
-    except httpx.ConnectError:
+    except httpx.RequestError:
         return "offline"
-    except httpx.TimeoutException:
-        return "timeout"
     except Exception as exc:
         return f"error: {exc}"
 
 
 @router.get("/system/status")
 async def system_status():
-    agents = {
-        "log_agent": await _async_probe("http://127.0.0.1:8091/health"),
-        "diagnosis_agent": await _async_probe("http://127.0.0.1:8092/health"),
-        "remediation_agent": await _async_probe("http://127.0.0.1:8093/health"),
-        "commander": await _async_probe("http://127.0.0.1:8094/health"),
-    }
-    mcps = {
-        "log_mcp": await _async_probe("http://127.0.0.1:8081/mcp"),
-        "diagnostic_mcp": await _async_probe("http://127.0.0.1:8082/mcp"),
-        "remediation_mcp": await _async_probe("http://127.0.0.1:8083/mcp"),
-    }
-    armoriq = {"configured": bool(os.environ.get("ARMORIQ_API_KEY", "").strip())}
-    gemini = {"configured": bool(os.environ.get("AEGISOPS_GEMINI_API_KEY", "").strip())}
-    auth_api_status = await _async_probe("http://localhost:8080/health")
     try:
-        result = await _async_probe("http://auth-api:5001/health")
-        docker_auth = result
-    except Exception:
-        docker_auth = "not_reachable"
-    auth_api = {
-        "http": auth_api_status,
-        "docker": docker_auth,
-    }
-    return {
-        "agents": agents,
-        "mcps": mcps,
-        "armoriq": armoriq,
-        "gemini": gemini,
-        "auth_api": auth_api,
-        "uptime_seconds": time.time() - state.started_at,
-    }
+        async def probe_agent(name: str, url: str) -> tuple[str, str]:
+            return name, await _async_probe(url, timeout=2.0)
+
+        async def probe_mcp(name: str, url: str) -> tuple[str, str]:
+            return name, await _async_probe(url, timeout=2.0)
+
+        # Run all probes concurrently
+        agent_probes = [
+            probe_agent("log_agent", "http://log-agent:8091/health"),
+            probe_agent("diagnosis_agent", "http://diagnosis-agent:8092/health"),
+            probe_agent("remediation_agent", "http://remediation-agent:8093/health"),
+            probe_agent("commander", "http://commander:8094/health"),
+        ]
+        mcp_probes = [
+            probe_mcp("log_mcp", "http://log-mcp:8081/mcp"),
+            probe_mcp("diagnostic_mcp", "http://diagnostic-mcp:8082/mcp"),
+            probe_mcp("remediation_mcp", "http://remediation-mcp:8083/mcp"),
+        ]
+
+        agent_results = await asyncio.gather(*agent_probes, return_exceptions=True)
+        mcp_results = await asyncio.gather(*mcp_probes, return_exceptions=True)
+
+        agents = {}
+        for result in agent_results:
+            if isinstance(result, Exception):
+                logger.warning(f"Agent probe failed: {result}")
+                continue
+            name, status = result
+            agents[name] = status
+
+        mcps = {}
+        for result in mcp_results:
+            if isinstance(result, Exception):
+                logger.warning(f"MCP probe failed: {result}")
+                continue
+            name, status = result
+            mcps[name] = status
+
+        armoriq = {"configured": bool(os.environ.get("ARMORIQ_API_KEY", "").strip())}
+        gemini = {"configured": bool(os.environ.get("AEGISOPS_GEMINI_API_KEY", "").strip())}
+        auth_api_status = await _async_probe("http://auth-api:8080/health", timeout=2.0)
+        docker_auth = await _async_probe("http://auth-api:8080/health", timeout=2.0)
+        auth_api = {
+            "http": auth_api_status,
+            "docker": docker_auth,
+        }
+        return {
+            "agents": agents,
+            "mcps": mcps,
+            "armoriq": armoriq,
+            "gemini": gemini,
+            "auth_api": auth_api,
+            "uptime_seconds": time.time() - _started_at,
+        }
+    except Exception as exc:
+        logger.exception("system_status failed")
+        # Return a graceful degraded response instead of 500
+        return {
+            "agents": {},
+            "mcps": {},
+            "armoriq": {"configured": bool(os.environ.get("ARMORIQ_API_KEY", "").strip())},
+            "gemini": {"configured": bool(os.environ.get("AEGISOPS_GEMINI_API_KEY", "").strip())},
+            "auth_api": {"http": "error", "docker": "error"},
+            "uptime_seconds": time.time() - _started_at,
+        }
 
 
 @router.get("/system/configuration")

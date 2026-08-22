@@ -4,6 +4,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { Layout } from './components/Layout';
 import { LoadingState } from './components/LoadingState';
 import { Dashboard } from './pages/Dashboard';
+import { Incidents } from './pages/Incidents';
 import { IncidentDetail } from './pages/IncidentDetail';
 import { Security } from './pages/Security';
 import { Audit } from './pages/Audit';
@@ -33,7 +34,7 @@ function Router() {
             return _jsx(IncidentDetail, { incidentId: id });
         }
         if (path === '/incidents')
-            return _jsx(Dashboard, {});
+            return _jsx(Incidents, {});
         if (path === '/security')
             return _jsx(Security, {});
         if (path === '/audit')
