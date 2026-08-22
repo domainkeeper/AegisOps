@@ -13,8 +13,8 @@ export function Dashboard() {
   const { events: sseEvents, connected } = useSSE();
 
   const securitySummary = useMemo(() => {
-    if (!auditReq.data?.events) return { authorized: 0, blocked: 0, failed: 0 };
-    const events = auditReq.data.events;
+    if (!auditReq.data?.items) return { authorized: 0, blocked: 0, failed: 0 };
+    const events = auditReq.data.items;
     return {
       authorized: events.filter(e => e.status === 'allowed' || e.status === 'authorized' || e.status === 'success').length,
       blocked: events.filter(e => e.status === 'blocked').length,
@@ -22,9 +22,26 @@ export function Dashboard() {
     };
   }, [auditReq.data]);
 
-  const activeIncidents = (incidentsReq.data?.incidents ?? []).filter(
+  const activeIncidents = (incidentsReq.data?.items ?? []).filter(
     inc => inc.status !== 'resolved' && inc.status !== 'closed'
   );
+
+  const systemComponents = useMemo(() => {
+    if (!statusReq.data) return [];
+    const agents: Record<string, string> = statusReq.data.agents ?? {};
+    const mcps: Record<string, string> = statusReq.data.mcps ?? {};
+    const armoriq = statusReq.data.armoriq ?? { configured: false };
+    const gemini = statusReq.data.gemini ?? { configured: false };
+    const auth_api = statusReq.data.auth_api ?? { http: 'unknown', docker: 'unknown' };
+    return [
+      ...Object.entries(agents).map(([name, status]) => ({ name: `Agent: ${name}`, status, detail: '' })),
+      ...Object.entries(mcps).map(([name, status]) => ({ name: `MCP: ${name}`, status, detail: '' })),
+      { name: 'ArmorIQ', status: armoriq.configured ? 'healthy' : 'not_configured', detail: armoriq.configured ? 'Configured' : 'Not configured' },
+      { name: 'Gemini', status: gemini.configured ? 'healthy' : 'not_configured', detail: gemini.configured ? 'Configured' : 'Not configured' },
+      { name: 'auth-api (HTTP)', status: auth_api.http || 'unknown', detail: '' },
+      { name: 'auth-api (Docker)', status: auth_api.docker || 'unknown', detail: '' },
+    ];
+  }, [statusReq.data]);
 
   if (statusReq.loading && incidentsReq.loading && auditReq.loading) {
     return <LoadingState />;
@@ -45,12 +62,12 @@ export function Dashboard() {
           <LoadingState />
         ) : statusReq.error ? (
           <ErrorState message={statusReq.error} onRetry={statusReq.refresh} />
-        ) : !statusReq.data?.components.length ? (
+        ) : systemComponents.length === 0 ? (
           <div className="empty-state">No components reported</div>
         ) : (
           <div className="grid-4">
-            {statusReq.data.components.map(c => (
-              <div key={c.name} className="card" style={{ padding: '0.75rem 1rem' }}>
+            {systemComponents.map((c, i) => (
+              <div key={i} className="card" style={{ padding: '0.75rem 1rem' }}>
                 <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>{c.name}</div>
                 <StatusBadge status={c.status} />
                 <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>{c.detail}</div>
@@ -119,7 +136,7 @@ export function Dashboard() {
                     <td><StatusBadge status={inc.severity} /></td>
                     <td><StatusBadge status={inc.status} /></td>
                     <td style={{ fontSize: '0.75rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-                      {new Date(inc.created_at).toLocaleString()}
+                      {inc.created_at ? new Date(inc.created_at).toLocaleString() : '-'}
                     </td>
                   </tr>
                 ))}
@@ -166,7 +183,7 @@ export function Dashboard() {
                     minWidth: '14ch',
                   }}
                 >
-                  {new Date(e.created_at).toLocaleTimeString()}
+                  {e.created_at ? new Date(e.created_at).toLocaleTimeString() : '-'}
                 </span>
                 <StatusBadge status={e.status} />
                 <span style={{ color: 'var(--text-secondary)' }}>{e.agent}</span>

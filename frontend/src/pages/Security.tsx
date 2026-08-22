@@ -2,6 +2,7 @@ import { useApi } from '../hooks/useApi';
 import { api } from '../services/api';
 import { LoadingState } from '../components/LoadingState';
 import { ErrorState } from '../components/ErrorState';
+import type { AuthorityEntry } from '../types/api';
 
 export function Security() {
   const { data, loading, error, refresh } = useApi(() => api.authority(), []);
@@ -9,6 +10,13 @@ export function Security() {
   if (loading) return <LoadingState />;
   if (error) return <ErrorState message={error} onRetry={refresh} />;
   if (!data) return <ErrorState message="Failed to load authority data" />;
+
+  // The backend returns `authority_model` but the type is `AuthorityResponse`
+  // Cast to access the actual response structure
+  const raw = data as unknown as Record<string, unknown>;
+  const authority = (raw.authority_model as AuthorityEntry[] | undefined) ?? [];
+  const planActions = (raw.plan_actions as string[] | undefined) ?? [];
+  const note = (raw.note as string | undefined) ?? '';
 
   return (
     <div>
@@ -24,11 +32,11 @@ export function Security() {
         <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
           Top-level actions defined in the root plan that agents may be delegated to execute.
         </p>
-        {data.plan_actions.length === 0 ? (
+        {planActions.length === 0 ? (
           <div className="empty-state">No plan actions defined</div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-            {data.plan_actions.map((action, i) => (
+            {planActions.map((action, i) => (
               <div
                 key={i}
                 style={{
@@ -51,13 +59,13 @@ export function Security() {
         )}
       </div>
 
-      {data.delegations.length === 0 ? (
+      {authority.length === 0 ? (
         <div className="card">
           <div className="empty-state">No delegation entries configured</div>
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-          {data.delegations.map((entry, i) => (
+          {authority.map((entry: AuthorityEntry, i: number) => (
             <div
               key={i}
               className="card"
@@ -100,7 +108,7 @@ export function Security() {
                     Steps
                   </div>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem' }}>
-                    {entry.steps.map((step, si) => (
+                    {entry.steps.map((step: string, si: number) => (
                       <span
                         key={si}
                         style={{
@@ -132,7 +140,7 @@ export function Security() {
                   Allowed Actions
                 </div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem' }}>
-                  {entry.allowed_actions.map((action, ai) => (
+                  {(entry.allowed_actions ?? []).map((action: string, ai: number) => (
                     <span
                       key={ai}
                       style={{
@@ -155,7 +163,7 @@ export function Security() {
         </div>
       )}
 
-      {data.note && (
+      {note && (
         <div
           className="card"
           style={{
@@ -165,7 +173,7 @@ export function Security() {
           }}
         >
           <div className="card-header" style={{ color: 'var(--yellow)' }}>Note</div>
-          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{data.note}</p>
+          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{note}</p>
         </div>
       )}
     </div>

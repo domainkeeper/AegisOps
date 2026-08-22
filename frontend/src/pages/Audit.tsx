@@ -87,7 +87,7 @@ export function Audit() {
         <LoadingState />
       ) : error ? (
         <ErrorState message={error} onRetry={refresh} />
-      ) : !data || data.events.length === 0 ? (
+      ) : !data || !data.items || data.items.length === 0 ? (
         <div className="card">
           <div className="empty-state">No audit events match your filters</div>
         </div>
@@ -106,7 +106,7 @@ export function Audit() {
                 </tr>
               </thead>
               <tbody>
-                {data.events.map((ev, i) => (
+                {data.items.map((ev, i) => (
                   <tr
                     key={i}
                     onClick={() => {
@@ -122,7 +122,7 @@ export function Audit() {
                         whiteSpace: 'nowrap',
                       }}
                     >
-                      {new Date(ev.created_at).toLocaleString()}
+                      {ev.created_at ? new Date(ev.created_at).toLocaleString() : '-'}
                     </td>
                     <td
                       style={{

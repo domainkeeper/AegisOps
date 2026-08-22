@@ -9,7 +9,9 @@ export function Services() {
 
   if (loading) return <LoadingState />;
   if (error) return <ErrorState message={error} onRetry={refresh} />;
-  if (!data || data.length === 0) return <div className="empty-state">No services reported</div>;
+  if (!data) return <div className="empty-state">No services reported</div>;
+
+  const services = data.services ?? [];
 
   return (
     <div>
@@ -20,64 +22,48 @@ export function Services() {
         </div>
       </div>
 
-      <div className="grid-4">
-        {data.map(svc => (
-          <div key={svc.name} className="card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-              <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{svc.name}</span>
-              <StatusBadge status={svc.health} />
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', fontSize: '0.8rem' }}>
-              {svc.image && (
-                <div>
-                  <span style={{ color: 'var(--text-muted)' }}>Image: </span>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                    {svc.image}
-                  </span>
+      {services.length === 0 ? (
+        <div className="empty-state">No services reported</div>
+      ) : (
+        <div className="grid-4">
+          {services.map(svc => {
+            const healthStatus = typeof svc.health === 'string' ? svc.health : (svc.health as { status?: string } | null)?.status || 'unknown';
+            const dockerInfo = svc.docker as { name?: string; state?: string; image?: string } | null | undefined;
+            return (
+              <div key={svc.name} className="card">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                  <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{svc.name}</span>
+                  <StatusBadge status={healthStatus} />
                 </div>
-              )}
-              {svc.container && (
-                <div>
-                  <span style={{ color: 'var(--text-muted)' }}>Container: </span>
-                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                    {svc.container}
-                  </span>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', fontSize: '0.8rem' }}>
+                  {dockerInfo?.image && (
+                    <div>
+                      <span style={{ color: 'var(--text-muted)' }}>Image: </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                        {dockerInfo.image}
+                      </span>
+                    </div>
+                  )}
+                  {dockerInfo?.name && (
+                    <div>
+                      <span style={{ color: 'var(--text-muted)' }}>Container: </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                        {dockerInfo.name}
+                      </span>
+                    </div>
+                  )}
+                  {dockerInfo?.state && (
+                    <div>
+                      <span style={{ color: 'var(--text-muted)' }}>State: </span>
+                      <span style={{ color: 'var(--text-secondary)' }}>{dockerInfo.state}</span>
+                    </div>
+                  )}
                 </div>
-              )}
-              {svc.started_at && (
-                <div>
-                  <span style={{ color: 'var(--text-muted)' }}>Started: </span>
-                  <span style={{ color: 'var(--text-secondary)' }}>
-                    {new Date(svc.started_at).toLocaleString()}
-                  </span>
-                </div>
-              )}
-              {svc.restart_count !== null && svc.restart_count !== undefined && (
-                <div>
-                  <span style={{ color: 'var(--text-muted)' }}>Restarts: </span>
-                  <span style={{ color: 'var(--text-secondary)' }}>{svc.restart_count}</span>
-                </div>
-              )}
-              {svc.last_incident && (
-                <div>
-                  <span style={{ color: 'var(--text-muted)' }}>Last Incident: </span>
-                  <a
-                    href={`/incidents/${svc.last_incident}`}
-                    onClick={e => {
-                      e.preventDefault();
-                      window.history.pushState({}, '', `/incidents/${svc.last_incident}`);
-                      window.dispatchEvent(new PopStateEvent('popstate'));
-                    }}
-                    style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem' }}
-                  >
-                    {svc.last_incident}
-                  </a>
-                </div>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

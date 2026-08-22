@@ -17,6 +17,8 @@ export function SystemConfig() {
   const armoriq = configReq.data?.armoriq as Record<string, unknown> | undefined;
   const auth = configReq.data?.auth as Record<string, unknown> | undefined;
   const cors = configReq.data?.cors_origins as string[] | undefined;
+  const agentsData = ((agentsReq.data as unknown as { agents?: Record<string, unknown> } | undefined)?.agents) ?? {};
+  const mcpsData = ((mcpsReq.data as unknown as { mcps?: Record<string, unknown> } | undefined)?.mcps) ?? {};
 
   return (
     <div>
@@ -90,10 +92,10 @@ export function SystemConfig() {
             <div className="empty-state">No agent data</div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              {Object.entries(agentsReq.data).map(([name, info]) => (
+              {Object.entries(agentsData).map(([name, info]) => (
                 <div key={name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <span style={{ fontSize: '0.85rem' }}>{name.replace(/_/g, ' ')}</span>
-                  <StatusBadge status={(info as { status: string }).status} />
+                  <StatusBadge status={(info as { status?: string }).status || 'unknown'} />
                 </div>
               ))}
             </div>
@@ -110,10 +112,10 @@ export function SystemConfig() {
             <div className="empty-state">No MCP data</div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-              {Object.entries(mcpsReq.data).map(([name, info]) => (
+              {Object.entries(mcpsData).map(([name, info]) => (
                 <div key={name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <span style={{ fontSize: '0.85rem' }}>{name.replace(/_/g, ' ')}</span>
-                  <StatusBadge status={(info as { status: string }).status} />
+                  <StatusBadge status={(info as { status?: string }).status || 'unknown'} />
                 </div>
               ))}
             </div>
@@ -132,8 +134,8 @@ export function SystemConfig() {
             <div className="empty-state">No auth config</div>
           ) : (
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <StatusBadge status={auth.enabled ? 'healthy' : 'not_configured'} />
-              <span style={{ fontSize: '0.85rem' }}>{auth.enabled ? 'Enabled' : 'Disabled'}</span>
+              <StatusBadge status={auth.enforced ? 'healthy' : 'not_configured'} />
+              <span style={{ fontSize: '0.85rem' }}>{auth.enforced ? 'Enforced' : 'Not Enforced'}</span>
             </div>
           )}
         </div>

@@ -5,8 +5,12 @@ export interface ComponentStatus {
 }
 
 export interface SystemStatus {
-  overall: string;
-  components: ComponentStatus[];
+  agents: Record<string, string>;
+  mcps: Record<string, string>;
+  armoriq: { configured: boolean };
+  gemini: { configured: boolean };
+  auth_api: { http: string; docker: string };
+  uptime_seconds: number;
 }
 
 export interface IncidentSummary {
@@ -14,6 +18,7 @@ export interface IncidentSummary {
   service: string;
   status: string;
   severity: string;
+  description?: string;
   created_at: string;
   updated_at: string;
   summary?: string;
@@ -22,7 +27,7 @@ export interface IncidentSummary {
 }
 
 export interface IncidentListResponse {
-  incidents: IncidentSummary[];
+  items: IncidentSummary[];
   total: number;
   limit: number;
   offset: number;
@@ -57,24 +62,6 @@ export interface AgentAction {
   reason: string;
 }
 
-export interface IncidentDetail {
-  id: string;
-  service: string;
-  status: string;
-  severity: string;
-  description?: string;
-  created_at: string;
-  updated_at: string;
-  resolved_at?: string | null;
-  summary?: string;
-  diagnosis?: DiagnosisData | null;
-  timeline?: TimelineEvent[];
-  authorization_events?: AgentAction[];
-  intent_token_status?: string;
-  governed?: boolean;
-  error?: string | null;
-}
-
 export interface AuditEvent {
   incident_id: string;
   agent: string;
@@ -87,8 +74,28 @@ export interface AuditEvent {
   created_at: string;
 }
 
+export interface IncidentDetail {
+  id: string;
+  service: string;
+  status: string;
+  severity: string;
+  description?: string;
+  created_at: string;
+  updated_at: string;
+  resolved_at?: string | null;
+  summary?: string;
+  diagnosis?: string | null;
+  recommended_action?: string;
+  resolution?: string;
+  intent_token_status?: string;
+  governed?: boolean;
+  error?: string | null;
+  timeline?: TimelineEvent[];
+  audit_events?: AuditEvent[];
+}
+
 export interface AuditListResponse {
-  events: AuditEvent[];
+  items: AuditEvent[];
   total: number;
   limit: number;
   offset: number;
@@ -108,12 +115,13 @@ export interface AuthorityResponse {
 
 export interface ServiceStatus {
   name: string;
-  health: string;
+  health: string | { status?: string; http_status?: number; detail?: string } | null;
   container?: string | null;
   started_at?: string | null;
   restart_count?: number | null;
   image?: string | null;
   last_incident?: string | null;
+  docker?: { id?: string; state?: string; image?: string; name?: string } | null;
 }
 
 export interface AgentStatus {

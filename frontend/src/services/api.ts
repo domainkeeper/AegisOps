@@ -40,8 +40,8 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  health: () => request<Record<string, unknown>>('/health/live'),
-  ready: () => request<Record<string, unknown>>('/health/ready'),
+  health: () => request<{ status: string; uptime_seconds: number }>('/health/live'),
+  ready: () => request<{ status: string; database: string }>('/health/ready'),
   systemStatus: () => request<SystemStatus>('/system/status'),
   configuration: () => request<Record<string, unknown>>('/system/configuration'),
 
@@ -62,9 +62,9 @@ export const api = {
     description?: string;
   }) => request<IncidentDetail>('/incidents', { method: 'POST', body: JSON.stringify(data) }),
 
-  getIncidentTimeline: (id: string) => request<TimelineEvent[]>(`/incidents/${id}/timeline`),
+  getIncidentTimeline: (id: string) => request<{ incident_id: string; timeline: TimelineEvent[] }>(`/incidents/${id}/timeline`),
 
-  getIncidentAudit: (id: string) => request<AuditEvent[]>(`/incidents/${id}/audit`),
+  getIncidentAudit: (id: string) => request<{ incident_id: string; audit_events: AuditEvent[] }>(`/incidents/${id}/audit`),
 
   listAudit: (params?: {
     limit?: number;
@@ -82,11 +82,11 @@ export const api = {
 
   authority: () => request<AuthorityResponse>('/security/authority'),
 
-  services: () => request<ServiceStatus[]>('/services'),
+  services: () => request<{ services: ServiceStatus[] }>('/services'),
 
-  agents: () => request<AgentStatus>('/agents'),
+  agents: () => request<{ agents: AgentStatus }>('/agents'),
 
-  mcps: () => request<MCPStatus>('/mcps'),
+  mcps: () => request<{ mcps: MCPStatus }>('/mcps'),
 
   login: (username: string, password: string) =>
     request<LoginResponse>('/auth/login', {
